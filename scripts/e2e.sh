@@ -6,7 +6,7 @@ set -eu
 BIN="${1:-./target/release/internet-token-engine}"
 ROOT="$(pwd)"
 WORK="$(mktemp -d /tmp/rwt-e2e-XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null; fi; rm -rf "$WORK" ${WORK4:-}' EXIT
 echo "work dir: $WORK"
 
 # Default path: neural trainer (Phase 3). The verify block below
@@ -108,3 +108,56 @@ assert "counts" in model and model.get("kind") != "neural", "not an n-gram model
 print(f"n-gram verify OK: heldout_loss={ev['heldout_loss']:.4f} perplexity={ev['perplexity']:.2f} probe_loss={ev['probe_loss']:.4f}")
 EOF
 rm -rf "$WORK3"
+
+echo "=== WARC path (Phase 4: local Range server, real HTTP + gzip + parse) ==="
+WORK4="$(mktemp -d /tmp/rwt-e2e-warc-XXXXXX)"
+python3 - "$ROOT/fixtures/warc-multi.warc.gz" "$WORK4/port" <<'EOF' &
+import sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+data = open(sys.argv[1], "rb").read()
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        start, end = 0, len(data) - 1
+        status = 200
+        r = self.headers.get("Range")
+        if r and r.startswith("bytes="):
+            a, b = r[len("bytes="):].split("-", 1)
+            start, end = int(a), int(b)
+            status = 206
+        body = data[start:end + 1]
+        self.send_response(status)
+        self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+srv.daemon_threads = True
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+EOF
+SERVER_PID=$!
+for i in $(seq 1 50); do [ -f "$WORK4/port" ] && break; sleep 0.1; done
+PORT="$(cat "$WORK4/port")"
+cat > "$WORK4/manifest.json" <<EOF
+{"items":[{"url":"http://example.com/river","filename":"crawl-data/CC-MAIN-2025-30/segments/test.warc.gz","offset":170,"length":362,"license":"public-domain"}]}
+EOF
+"$BIN" --root "$WORK4" ingest --cc-warc-manifest "$WORK4/manifest.json" --cc-data-base "http://127.0.0.1:$PORT/"
+python3 - "$WORK4" <<'EOF'
+import glob, json, sys
+work = sys.argv[1]
+found = False
+for path in glob.glob(f"{work}/data/shards/*.json"):
+    d = json.load(open(path))
+    if d["source"] == "cc:crawl-data/CC-MAIN-2025-30/segments/test.warc.gz@170:http://example.com/river":
+        assert d["category"] == "common-crawl" and d["license"] == "public-domain", d
+        assert "The river flows" in d["text"] and "Morning mist" in d["text"], d["text"]
+        assert "var x" not in d["text"], "script content leaked"
+        found = True
+assert found, "no shard with expected WARC provenance + text"
+print("WARC verify OK: Range + gunzip + parse + extract + provenance")
+EOF
+kill "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+rm -rf "$WORK4"
+WORK4=""

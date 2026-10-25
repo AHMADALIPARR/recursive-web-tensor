@@ -10,8 +10,11 @@
 //! Implemented remote paths:
 //! - URL manifest: GET each listed URL, cap 2,000,000 bytes.
 //! - Common Crawl index lookup: GET an index API URL, cap 1,000,000
-//!   bytes, parse the JSON-lines records into a manifest. WARC
-//!   record fetching is NOT implemented (later milestone).
+//!   bytes, parse the JSON-lines records into a manifest.
+//! - Common Crawl WARC fetching: HTTP Range requests against
+//!   `data.commoncrawl.org` (or a local base in tests), gzip member
+//!   decompression via the system `gzip` binary, WARC parsing in
+//!   `warc.rs`. See `docs/warc.md`.
 //! - DuckDuckGo discovery: GET the html-lite endpoint, extract
 //!   `uddg=` result URLs. HTML is treated as text; no JS runs.
 
@@ -37,6 +40,83 @@ pub fn curl_get(url: &str, max_time_secs: u64, max_bytes: u64) -> Result<Vec<u8>
         return Err(format!("curl failed for {}: {}", url, stderr.trim()));
     }
     Ok(out.stdout)
+}
+
+/// Run curl for a single HTTP Range request: bytes
+/// [offset, offset+length). Only http(s) URLs. A non-success curl
+/// status or a short body is an error (a truncated member must not
+/// parse as a valid record downstream).
+pub fn curl_range(url: &str, offset: i64, length: i64, max_time_secs: u64) -> Result<Vec<u8>, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("refusing non-http(s) range URL: {}", url));
+    }
+    if offset < 0 || length <= 0 {
+        return Err(format!("invalid range offset={} length={}", offset, length));
+    }
+    let end = offset + length - 1;
+    let range = format!("{}-{}", offset, end);
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "-L",
+            "--max-time",
+            &max_time_secs.to_string(),
+            "-r",
+            &range,
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("curl range failed for {}: {}", url, stderr.trim()));
+    }
+    if (out.stdout.len() as i64) != length {
+        return Err(format!(
+            "range {} for {} returned {} bytes, expected {}",
+            range,
+            url,
+            out.stdout.len(),
+            length
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Decompress gzip bytes via the system `gzip` binary (same
+/// dependency class as `curl`: present on GitHub-hosted runners).
+/// `max_bytes` caps the decompressed output; anything larger is an
+/// error, never a silent truncation.
+pub fn gunzip(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut child = Command::new("gzip")
+        .args(["-dc"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run gzip: {}", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(bytes);
+    }
+    let out = child.wait_with_output().map_err(|e| format!("gzip failed: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("gzip decompression failed: {}", stderr.trim()));
+    }
+    if out.stdout.len() > max_bytes {
+        return Err(format!(
+            "decompressed output {} bytes exceeds cap {}",
+            out.stdout.len(),
+            max_bytes
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// True when these bytes look like a gzip member (magic 1f 8b).
+pub fn is_gzip(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
 }
 
 /// Percent-encode a query string (RFC 3986 unreserved set kept bare).
@@ -122,7 +202,22 @@ pub struct CcRecord {
 /// Parse Common Crawl index JSON-lines text into records. Lines that
 /// fail to parse are skipped and counted, never fatal: the index is
 /// untrusted remote input.
+///
+/// NOTE (found by a live smoke test, Phase 4): the real index API
+/// returns `offset` and `length` as STRINGS ("204233603"), not
+/// numbers. Both forms are accepted; a record with an unparseable
+/// offset/length is skipped, never defaulted to 0 (a 0 range would
+/// fetch the wrong bytes and parse as a false record).
 pub fn parse_cc_index(text: &str) -> (Vec<CcRecord>, usize) {
+    fn as_i64(v: &crate::json::Value) -> Option<i64> {
+        if let Some(n) = v.as_i64() {
+            return Some(n);
+        }
+        if let Some(s) = v.as_str() {
+            return s.trim().parse::<i64>().ok();
+        }
+        None
+    }
     let mut records = Vec::new();
     let mut skipped = 0usize;
     for line in text.lines() {
@@ -135,12 +230,13 @@ pub fn parse_cc_index(text: &str) -> (Vec<CcRecord>, usize) {
                 let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let filename =
                     v.get("filename").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let offset = v.get("offset").and_then(|x| x.as_i64()).unwrap_or(0);
-                let length = v.get("length").and_then(|x| x.as_i64()).unwrap_or(0);
-                if url.is_empty() || filename.is_empty() {
-                    skipped += 1;
-                } else {
-                    records.push(CcRecord { url, filename, offset, length });
+                let offset = v.get("offset").and_then(as_i64);
+                let length = v.get("length").and_then(as_i64);
+                match (url.is_empty(), filename.is_empty(), offset, length) {
+                    (false, false, Some(offset), Some(length)) => {
+                        records.push(CcRecord { url, filename, offset, length });
+                    }
+                    _ => skipped += 1,
                 }
             }
             Err(_) => skipped += 1,
@@ -167,13 +263,45 @@ mod tests {
     fn cc_index_fixture() {
         let text = r#"{"url":"example.com/a","status":"200","filename":"crawl-data/CC-MAIN-2025-30/segments/x.warc.gz","offset":123,"length":456,"digest":"abc"}
 {"url":"example.com/b","status":"200","filename":"crawl-data/CC-MAIN-2025-30/segments/y.warc.gz","offset":789,"length":10}
+{"url":"example.com/c","status":"200","filename":"crawl-data/CC-MAIN-2025-30/segments/z.warc.gz","offset":"204233603","length":"996"}
 not json at all
-{"url":"","filename":""}"#;
+{"url":"","filename":""}
+{"url":"example.com/d","filename":"crawl-data/CC-MAIN-2025-30/segments/w.warc.gz","offset":"not-a-number","length":"10"}"#;
         let (records, skipped) = parse_cc_index(text);
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         assert_eq!(records[0].offset, 123);
         assert_eq!(records[0].length, 456);
-        assert_eq!(skipped, 2);
+        // String-form offsets/lengths (what the real API returns).
+        assert_eq!(records[2].offset, 204233603);
+        assert_eq!(records[2].length, 996);
+        assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn gunzip_fixture_round_trip() {
+        let gz = std::fs::read("fixtures/warc-sample.warc.gz").unwrap();
+        assert!(is_gzip(&gz));
+        let plain = std::fs::read("fixtures/warc-sample.warc").unwrap();
+        assert!(!is_gzip(&plain));
+        let out = gunzip(&gz, 10_000_000).unwrap();
+        assert_eq!(out, plain);
+        // Cap enforced, not silently truncated.
+        assert!(gunzip(&gz, 10).is_err());
+        // Non-gzip input fails, never passes through as text.
+        assert!(gunzip(b"not gzip at all", 10_000_000).is_err());
+    }
+
+    #[test]
+    fn gunzip_multi_member_slice() {
+        // A single member sliced out of the multi-member fixture
+        // decompresses standalone — the real CC range layout.
+        let gz = std::fs::read("fixtures/warc-multi.warc.gz").unwrap();
+        let member = &gz[170..170 + 362];
+        assert!(is_gzip(member));
+        let out = gunzip(member, 10_000_000).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("WARC-Type: response"));
+        assert!(text.contains("The River"));
     }
 
     #[test]

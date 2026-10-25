@@ -333,6 +333,9 @@ pub struct IngestArgs {
     pub corpus: Option<String>,
     pub url_manifest: Option<String>,
     pub cc_index: Option<String>,
+    pub cc_warc_manifest: Option<String>,
+    pub cc_data_base: Option<String>,
+    pub cc_max_records: usize,
     pub ddg_query: Option<String>,
     pub shard: Option<usize>,
     pub num_shards: usize,
@@ -340,6 +343,11 @@ pub struct IngestArgs {
     pub bpe_merges: Option<String>,
     pub config: Config,
 }
+
+/// Per-record caps for WARC fetching (see docs/warc.md).
+const WARC_MAX_COMPRESSED: i64 = 10_000_000;
+const WARC_MAX_DECOMPRESSED: usize = 10_000_000;
+const WARC_MAX_TEXT: usize = 2_000_000;
 
 /// Ingest documents from a local corpus directory, a URL manifest,
 /// and optionally one Common Crawl index lookup and one DuckDuckGo
@@ -406,9 +414,108 @@ pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), 
         }
     }
 
+    if let Some(warc_manifest) = &a.cc_warc_manifest {
+        // WARC fetching: for each manifest item, Range-fetch the
+        // record bytes from the data host, gunzip .warc.gz members,
+        // parse WARC records, extract text from response records,
+        // and ingest them as documents with full provenance. See
+        // docs/warc.md. Failures are recorded and skipped, never
+        // fatal to the whole ingest.
+        let text = std::fs::read_to_string(warc_manifest)
+            .map_err(|e| format!("cannot read WARC manifest {}: {}", warc_manifest, e))?;
+        let v = json::parse(&text).map_err(|e| format!("bad WARC manifest JSON: {}", e))?;
+        let items: Vec<&Value> = match &v {
+            Value::Arr(arr) => arr.iter().collect(),
+            Value::Obj(_) => v.get("items").and_then(|x| x.as_arr()).map(|arr| arr.iter().collect()).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let base = a
+            .cc_data_base
+            .clone()
+            .unwrap_or_else(|| "https://data.commoncrawl.org/".to_string());
+        let base = base.trim_end_matches('/').to_string();
+        let mut warc_docs = 0usize;
+        let mut warc_empty = 0usize;
+        let mut warc_errors = 0usize;
+        let limit = if a.cc_max_records == 0 { usize::MAX } else { a.cc_max_records };
+        for item in items.iter().take(limit) {
+            let url = item.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let filename = item.get("filename").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let offset = item.get("offset").and_then(|x| x.as_i64()).unwrap_or(-1);
+            let length = item.get("length").and_then(|x| x.as_i64()).unwrap_or(-1);
+            let license = item.get("license").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+            let mut fail = |msg: String| {
+                let mut err = Value::obj();
+                err.put("url", Value::s(&url));
+                err.put("filename", Value::s(&filename));
+                err.put("error", Value::s(&msg));
+                errors.push(err);
+                warc_errors += 1;
+            };
+            if filename.is_empty() || offset < 0 || length <= 0 {
+                fail("manifest item missing filename/offset/length".to_string());
+                continue;
+            }
+            if length > WARC_MAX_COMPRESSED {
+                fail(format!("compressed length {} exceeds cap {}", length, WARC_MAX_COMPRESSED));
+                continue;
+            }
+            let data_url = format!("{}/{}", base, filename);
+            let fetched = match fetch::curl_range(&data_url, offset, length, 30) {
+                Ok(b) => b,
+                Err(e) => {
+                    fail(e);
+                    continue;
+                }
+            };
+            let raw = if filename.ends_with(".gz") || fetch::is_gzip(&fetched) {
+                match fetch::gunzip(&fetched, WARC_MAX_DECOMPRESSED) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        fail(e);
+                        continue;
+                    }
+                }
+            } else {
+                fetched
+            };
+            let records = match crate::warc::parse_warc(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    fail(e);
+                    continue;
+                }
+            };
+            for record in records.iter().filter(|r| r.is_response()) {
+                let text = crate::warc::extract_text(record);
+                if text.is_empty() {
+                    warc_empty += 1;
+                    continue;
+                }
+                if text.len() > WARC_MAX_TEXT {
+                    fail(format!("extracted text {} bytes exceeds cap {}", text.len(), WARC_MAX_TEXT));
+                    continue;
+                }
+                // Provenance: the record's own target URI wins
+                // when present (it is the fetched page); the
+                // manifest URL is the fallback.
+                let page_url = record.target_uri().unwrap_or(&url);
+                let source = format!("cc:{}@{}:{}", filename, offset, page_url);
+                docs.push(make_doc(&source, "common-crawl", &license, &text, &mode));
+                warc_docs += 1;
+            }
+        }
+        println!(
+            "cc-warc: {} docs, {} empty-skipped, {} errors",
+            warc_docs, warc_empty, warc_errors
+        );
+    }
+
     if let Some(index_url) = &a.cc_index {
         // Index lookup only: fetch the index page, parse records,
-        // persist the manifest. WARC fetching is a later milestone.
+        // persist the manifest. WARC record fetching itself is the
+        // --cc-warc-manifest path above, which consumes the manifest
+        // this lookup writes.
         let bytes = fetch::curl_get(index_url, 30, 1_000_000)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let (records, skipped) = fetch::parse_cc_index(&text);
@@ -1656,6 +1763,9 @@ pub fn cmd_checkpoint(root: &Path, config: &Config) -> Result<Value, String> {
 pub struct CycleArgs {
     pub corpus: Option<String>,
     pub url_manifest: Option<String>,
+    pub cc_warc_manifest: Option<String>,
+    pub cc_data_base: Option<String>,
+    pub cc_max_records: usize,
     pub probe_dir: Option<String>,
     pub order: usize,
     pub max_depth: usize,
@@ -1678,6 +1788,9 @@ pub fn cmd_cycle(root: &Path, config: &Config, a: &CycleArgs) -> Result<Value, S
             corpus: a.corpus.clone(),
             url_manifest: a.url_manifest.clone(),
             cc_index: None,
+            cc_warc_manifest: a.cc_warc_manifest.clone(),
+            cc_data_base: a.cc_data_base.clone(),
+            cc_max_records: a.cc_max_records,
             ddg_query: None,
             shard: None,
             num_shards: 4,
@@ -1827,7 +1940,7 @@ mod tests {
         );
         cmd_ingest(
             &root,
-            &IngestArgs { corpus: Some(root.join("corpus").to_string_lossy().into_owned()), url_manifest: None, cc_index: None, ddg_query: None, shard: None, num_shards: 4, tokenizer: None, bpe_merges: None, config: Config::default() },
+            &IngestArgs { corpus: Some(root.join("corpus").to_string_lossy().into_owned()), url_manifest: None, cc_index: None, cc_warc_manifest: None, cc_data_base: None, cc_max_records: 0, ddg_query: None, shard: None, num_shards: 4, tokenizer: None, bpe_merges: None, config: Config::default() },
         )
         .unwrap();
         // Force licenses: rewrite shard files for c (unknown) and add a denied doc.
@@ -1893,6 +2006,9 @@ mod tests {
             &CycleArgs {
                 corpus: Some(root.join("corpus").to_string_lossy().into_owned()),
                 url_manifest: None,
+                cc_warc_manifest: None,
+                cc_data_base: None,
+                cc_max_records: 0,
                 probe_dir: None,
                 order: 0,
                 max_depth: 8,

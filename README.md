@@ -56,7 +56,7 @@ today.
 ## What does NOT exist yet
 
 - Internet-scale ingestion (see Phase 1 below).
-- WARC record fetching, global pruning (MinHash/LSH).
+- Global pruning (MinHash/LSH).
 - GPU training (the GPU runner slot runs the CPU trainer today).
 - A registered self-hosted GPU runner (owner's hardware step).
 - 100 million tokens processed. That number is a **target**, and the
@@ -252,8 +252,8 @@ Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
 ## Sources
 
 - `sources/duckduckgo.md` — discovery via the html-lite endpoint.
-- `sources/common-crawl.md` — index lookup (implemented) and WARC
-  fetching (later milestone).
+- `sources/common-crawl.md` — index lookup and WARC record fetching
+  (both implemented; see `docs/warc.md`).
 - `sources/github-corpus.md` — GitHub corpus via URL manifests and
   local clones (code search API needs auth; not faked).
 - `sources/license-policy.md` — allowlist/denylist and enforcement
@@ -262,7 +262,7 @@ Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
 ## Layout
 
 ```
-cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,scoring,sha256,json,fetch}.rs
+cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,scoring,sha256,json,fetch,warc}.rs
 .github/workflows/rwt-cycle.yml   Actions control plane
 docs/                              architecture, scoring, runners
 sources/                           discovery families + license policy

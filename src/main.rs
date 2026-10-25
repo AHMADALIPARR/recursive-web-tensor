@@ -13,6 +13,7 @@ mod bpe;
 mod engine;
 mod fetch;
 mod neural;
+mod warc;
 mod json;
 mod scoring;
 mod sha256;
@@ -60,7 +61,9 @@ fn usage() -> String {
      Global: --root <dir> (default .)\n\
      Commands:\n\
      \x20 ingest    --corpus <dir> [--url-manifest <file>] [--cc-index <url>]\n\
-     \x20             [--ddg-query <q>] [--shard <n>] [--num-shards <n>]\n\
+     \x20             [--cc-warc-manifest <file>] [--cc-data-base <url>]\n\
+     \x20             [--cc-max-records <n>] [--ddg-query <q>]\n\
+     \x20             [--shard <n>] [--num-shards <n>]\n\
      \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
      \x20 prune     [--shard <n>] [--num-shards <n>] [--max-depth <n>] [--tau <f>]\n\
      \x20 reduce    [--max-depth <n>]\n\
@@ -69,7 +72,8 @@ fn usage() -> String {
      \x20 evaluate  [--model <path>] [--probe-dir <dir>]\n\
      \x20 checkpoint\n\
      \x20 cycle     --corpus <dir> [--probe-dir <dir>] [--order <n>]\n\
-     \x20             [--max-depth <n>] [--steps <n>]\n\
+     \x20             [--cc-warc-manifest <file>] [--cc-data-base <url>]\n\
+     \x20             [--cc-max-records <n>] [--max-depth <n>] [--steps <n>]\n\
      \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
      \x20             [--trainer neural|ngram] [--epochs <n>] [--lr <f>]\n\
      \x20 tokenizer train-bpe --corpus <dir> [--merges <n>] [--out <file>]\n\
@@ -112,6 +116,9 @@ fn run() -> Result<(), String> {
                     corpus: args.get("corpus"),
                     url_manifest: args.get("url-manifest"),
                     cc_index: args.get("cc-index"),
+                    cc_warc_manifest: args.get("cc-warc-manifest"),
+                    cc_data_base: args.get("cc-data-base"),
+                    cc_max_records: args.get_usize("cc-max-records", 0),
                     ddg_query: args.get("ddg-query"),
                     shard,
                     num_shards: args.get_usize("num-shards", 4),
@@ -204,6 +211,9 @@ fn run() -> Result<(), String> {
                 &engine::CycleArgs {
                     corpus: args.get("corpus"),
                     url_manifest: args.get("url-manifest"),
+                    cc_warc_manifest: args.get("cc-warc-manifest"),
+                    cc_data_base: args.get("cc-data-base"),
+                    cc_max_records: args.get_usize("cc-max-records", 0),
                     probe_dir: args.get("probe-dir"),
                     order: args.get_usize("order", 0),
                     max_depth: args.get_usize("max-depth", 8),

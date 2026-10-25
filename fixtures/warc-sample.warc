@@ -1,0 +1,34 @@
+WARC/1.0
+WARC-Type: warcinfo
+WARC-Date: 2025-01-01T00:00:00Z
+WARC-Filename: test.warc.gz
+Content-Type: application/warc-fields
+Content-Length: 50
+
+software: rwt-test
+format: WARC File Format 1.0
+
+
+WARC/1.0
+WARC-Type: response
+WARC-Target-URI: http://example.com/river
+WARC-Date: 2025-01-01T00:00:01Z
+Content-Type: application/http; msgtype=response
+Content-Length: 353
+
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 273
+
+<html><head><title>River Valley</title><style>.x{color:red}</style><script>var x = 1;</script></head><body><!-- a comment --><h1>The River &amp; The Valley</h1><p>The river flows &lt;swiftly&gt; through the valley.</p><p>Morning mist hangs over the water.</p></body></html>
+
+WARC/1.0
+WARC-Type: metadata
+WARC-Target-URI: http://example.com/river
+WARC-Date: 2025-01-01T00:00:02Z
+Content-Type: text/plain
+Content-Length: 17
+
+fetchTimeMs: 42
+
+
