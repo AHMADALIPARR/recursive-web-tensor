@@ -1,0 +1,13 @@
+[package]
+name = "internet-token-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Reference CLI for RECURSIVE WEB TENSOR (RWT): a recursively pruned internet-token learning system orchestrated by GitHub Actions"
+license = "LicenseRef-Owner-TBD"
+
+[[bin]]
+name = "internet-token-engine"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2

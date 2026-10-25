@@ -1,0 +1,6 @@
+/target
+/state
+/data
+/checkpoints
+/output
+*.log

@@ -1,0 +1,224 @@
+# RECURSIVE WEB TENSOR — one bounded epoch per run.
+#
+# Design (see docs/architecture.md):
+# - Shard jobs NEVER write the model. Only the reduce -> train ->
+#   evaluate -> publish chain touches checkpoints, and only the
+#   publish job writes them (after the validation gate).
+# - Persistent state lives on the `rwt-state` branch, NOT on main.
+#   Jobs restore what they need from that branch (validation trend
+#   for prune, prior checkpoint for train, current pointer + parent
+#   manifest for publish) and publish commits the new state back.
+# - The workflow uses GITHUB_TOKEN only. No other secrets exist.
+# - Top-level permissions are contents:read. The publish job alone
+#   overrides to contents:write, because committing state to the
+#   rwt-state branch needs it; the skeleton's top-level
+#   contents:read alone is insufficient for publishing.
+# - Scaling limits (documented by GitHub): 6 hours per job,
+#   256-job matrix maximum. This workflow stays far inside both.
+
+name: Recursive Token Engine
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Also run the GPU training slot on a self-hosted GPU runner"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 */6 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: token-engine
+  cancel-in-progress: false
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore validation trend from rwt-state branch
+        run: |
+          mkdir -p state
+          git fetch origin rwt-state || true
+          git show origin/rwt-state:state/validation.json > state/validation.json 2>/dev/null || true
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Ingest shard
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus --shard ${{ matrix.shard }} --num-shards 4
+      - name: Prune shard
+        run: ./target/release/internet-token-engine --root . prune --shard ${{ matrix.shard }} --num-shards 4 --max-depth 8
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: state/shards/shard-${{ matrix.shard }}.json
+          retention-days: 7
+  reduce:
+    needs: process
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Download shard outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: state/shards
+          merge-multiple: true
+      - name: Reduce
+        run: ./target/release/internet-token-engine --root . reduce --max-depth 8
+      - name: Upload reduced set
+        uses: actions/upload-artifact@v4
+        with:
+          name: reduced
+          path: state/reduced.json
+          retention-days: 30
+  train:
+    needs: reduce
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore prior checkpoint from rwt-state branch
+        run: |
+          git fetch origin rwt-state || true
+          git checkout origin/rwt-state -- state checkpoints 2>/dev/null || true
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Re-ingest full corpus (deterministic; avoids shipping shard blobs)
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
+      - name: Download reduced set
+        uses: actions/download-artifact@v4
+        with:
+          name: reduced
+          path: state
+      - name: Train reference model
+        run: ./target/release/internet-token-engine --root . train --steps 100
+      - name: Upload candidate model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-next
+          path: state/model-next.json
+          retention-days: 30
+  train-gpu:
+    needs: reduce
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu == true
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Re-ingest full corpus
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
+      - name: Download reduced set
+        uses: actions/download-artifact@v4
+        with:
+          name: reduced
+          path: state
+      - name: Train on the GPU runner slot (reference trainer today)
+        run: ./target/release/internet-token-engine --root . train --steps 100
+      - name: Upload GPU-run candidate (artifact only; never writes checkpoints)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-next-gpu
+          path: state/model-next.json
+          retention-days: 30
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Re-ingest full corpus
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
+      - name: Download reduced set
+        uses: actions/download-artifact@v4
+        with:
+          name: reduced
+          path: state
+      - name: Download candidate model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-next
+          path: state
+      - name: Evaluate
+        run: ./target/release/internet-token-engine --root . evaluate --probe-dir fixtures/probe
+      - name: Upload evaluation
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation
+          path: state/evaluation.json
+          retention-days: 90
+  publish:
+    needs: evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore prior state from rwt-state branch
+        run: |
+          git fetch origin rwt-state || true
+          git checkout origin/rwt-state -- state checkpoints 2>/dev/null || true
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Re-ingest full corpus
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
+      - name: Download reduced set
+        uses: actions/download-artifact@v4
+        with:
+          name: reduced
+          path: state
+      - name: Download candidate model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-next
+          path: state
+      - name: Download evaluation
+        uses: actions/download-artifact@v4
+        with:
+          name: evaluation
+          path: state
+      - name: Checkpoint (only this job writes checkpoints)
+        run: ./target/release/internet-token-engine --root . checkpoint
+      - name: Upload checkpoint artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint
+          path: checkpoints/
+          retention-days: 90
+      - name: Commit state to rwt-state branch
+        run: |
+          cp -r state /tmp/rwt-state-out
+          cp -r checkpoints /tmp/rwt-checkpoints-out
+          git config user.name "rwt-bot"
+          git config user.email "rwt-bot@users.noreply.github.com"
+          git fetch origin rwt-state || true
+          git checkout rwt-state 2>/dev/null || git checkout -B rwt-state
+          rm -rf state checkpoints
+          cp -r /tmp/rwt-state-out state
+          cp -r /tmp/rwt-checkpoints-out checkpoints
+          git add state checkpoints
+          git diff --cached --quiet || git commit -m "rwt: checkpoint state"
+          git push origin rwt-state
