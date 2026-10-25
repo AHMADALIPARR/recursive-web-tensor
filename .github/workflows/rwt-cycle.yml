@@ -131,7 +131,7 @@ jobs:
         with:
           name: reduced
           path: state
-      - name: Train on the GPU runner slot (reference trainer today)
+      - name: Train on the GPU runner slot (CPU neural trainer today; GPU acceleration is a later milestone)
         run: ./target/release/internet-token-engine --root . train --steps 100
       - name: Upload GPU-run candidate (artifact only; never writes checkpoints)
         uses: actions/upload-artifact@v4

@@ -9,6 +9,11 @@ WORK="$(mktemp -d /tmp/rwt-e2e-XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 echo "work dir: $WORK"
 
+# Default path: neural trainer (Phase 3). The verify block below
+# pins structure and finiteness, not a loss value: on 8 fixture
+# docs the neural model overfits (see docs/neural.md), so its
+# held-out loss is worse than the n-gram's — the n-gram pins live
+# in the explicit n-gram section at the end.
 "$BIN" --root "$WORK" cycle --corpus "$ROOT/fixtures/corpus" --probe-dir "$ROOT/fixtures/probe" --steps 0
 
 MANIFEST="$WORK/checkpoints/v1/manifest.json"
@@ -84,3 +89,22 @@ assert checked > 0, "no shards checked"
 print(f"BPE verify OK: {checked} docs round-trip, vocab 456, v1 promoted")
 EOF
 rm -rf "$WORK2"
+
+echo "=== n-gram path (Phase 3: trainer still available) ==="
+WORK3="$(mktemp -d /tmp/rwt-e2e-ngram-XXXXXX)"
+"$BIN" --root "$WORK3" cycle --corpus "$ROOT/fixtures/corpus" --probe-dir "$ROOT/fixtures/probe" --steps 0 --trainer ngram
+python3 - "$WORK3" <<'EOF'
+import json, sys
+work = sys.argv[1]
+man = json.load(open(f"{work}/checkpoints/v1/manifest.json"))
+assert man["status"] == "promoted" and man["version"] == "v1", man
+ev = json.load(open(f"{work}/state/evaluation.json"))
+# Pinned regression values for the deterministic n-gram path on fixtures.
+assert abs(ev["heldout_loss"] - 4.9755) < 1e-3, ev["heldout_loss"]
+assert abs(ev["perplexity"] - 144.82) < 0.1, ev["perplexity"]
+assert abs(ev["probe_loss"] - 5.0683) < 1e-3, ev["probe_loss"]
+model = json.load(open(f"{work}/checkpoints/v1/model.json"))
+assert "counts" in model and model.get("kind") != "neural", "not an n-gram model"
+print(f"n-gram verify OK: heldout_loss={ev['heldout_loss']:.4f} perplexity={ev['perplexity']:.2f} probe_loss={ev['probe_loss']:.4f}")
+EOF
+rm -rf "$WORK3"

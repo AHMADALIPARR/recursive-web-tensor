@@ -38,14 +38,17 @@ today.
   `tokenizer: "bpe"` in config); the deterministic word/byte-level
   **reference tokenizer** remains the default and the fallback.
   See `docs/tokenizer.md`.
-- A **reference trainer**: an incremental n-gram language model
-  (default order 3) merged into the prior checkpoint (adapter-style
-  update, count-space replay). This is **statistical, not neural**.
-  The neural fine-tune of a small existing model on GPU runners is
-  the Phase-1 milestone and is **NOT in this repo yet** — but the
-  train command's interface (inputs: retained shards; outputs:
-  checkpoint manifest + metrics) is designed so a neural trainer
-  replaces it.
+- A **neural trainer** (Phase 3, real, the default): a small
+  feedforward NNLM (embedding 16 + tanh MLP 32 over a 4-token
+  context, softmax output) trained from scratch with
+  hand-implemented backprop + Adam, plus init-from-prior-checkpoint
+  and replay through the same checkpoint/gating interface. This is
+  **not** a fine-tune of a named pretrained model — no pretrained
+  weights exist here. The incremental n-gram trainer (order 3,
+  count-space replay) stays available via `--trainer ngram`, and
+  at fixture scale it generalizes better than the neural trainer
+  (held-out 4.98 vs neural 9.28 on 8 docs — overfitting, documented
+  in `docs/neural.md`, not hidden). See `docs/neural.md`.
 - A **validation gate**: a checkpoint is promoted only if held-out
   loss does not regress beyond tolerance; otherwise the prior
   checkpoint stands and the epoch is recorded as rejected.
@@ -53,7 +56,8 @@ today.
 ## What does NOT exist yet
 
 - Internet-scale ingestion (see Phase 1 below).
-- Neural training, WARC record fetching.
+- WARC record fetching, global pruning (MinHash/LSH).
+- GPU training (the GPU runner slot runs the CPU trainer today).
 - A registered self-hosted GPU runner (owner's hardware step).
 - 100 million tokens processed. That number is a **target**, and the
   section below says exactly what exists toward it.
@@ -258,7 +262,7 @@ Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
 ## Layout
 
 ```
-cli (Rust, std-only): src/{main,engine,tokenizer,bpe,scoring,sha256,json,fetch}.rs
+cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,scoring,sha256,json,fetch}.rs
 .github/workflows/rwt-cycle.yml   Actions control plane
 docs/                              architecture, scoring, runners
 sources/                           discovery families + license policy

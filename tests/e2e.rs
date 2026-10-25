@@ -61,6 +61,54 @@ fn cycle_produces_promoted_v1() {
 }
 
 #[test]
+fn cycle_ngram_promotes() {
+    // Explicit n-gram path (neural is the default since Phase 3).
+    let work = std::env::temp_dir().join(format!("rwt-e2e-ngram-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).unwrap();
+    let corpus = work.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    fs::write(
+        corpus.join("a.txt"),
+        "The river flows through the valley while morning mist hangs over the water and birds sing.",
+    )
+    .unwrap();
+    fs::write(
+        corpus.join("b.txt"),
+        "Mountains rise beyond the trees and snow covers the highest peaks through the winter months.",
+    )
+    .unwrap();
+    fs::write(
+        corpus.join("c.txt"),
+        "To cook rice well, rinse the grains until the water runs clear, then soak them before cooking.",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .arg("--root")
+        .arg(&work)
+        .arg("cycle")
+        .arg("--corpus")
+        .arg(&corpus)
+        .arg("--steps")
+        .arg("0")
+        .arg("--trainer")
+        .arg("ngram")
+        .output()
+        .expect("run ngram cycle");
+    assert!(
+        out.status.success(),
+        "ngram cycle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = fs::read_to_string(work.join("checkpoints/v1/manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\":\"promoted\""), "manifest: {}", manifest);
+    let model = fs::read_to_string(work.join("checkpoints/v1/model.json")).unwrap();
+    assert!(model.contains("\"counts\""), "not an n-gram model: {}", &model[..model.len().min(200)]);
+    let _ = fs::remove_dir_all(&work);
+}
+
+#[test]
 fn cycle_bpe_promotes() {
     let work = std::env::temp_dir().join(format!("rwt-e2e-bpe-{}", std::process::id()));
     let _ = fs::remove_dir_all(&work);

@@ -3,14 +3,16 @@
 //! Subcommands: ingest, prune, train, evaluate, reduce, checkpoint,
 //! cycle. Global flag: --root <dir> (default ".").
 //!
-//! This is a reference implementation: deterministic tokenization,
-//! heuristic scoring, n-gram reference training. The neural fine-tune
-//! on GPU runners is a Phase-1 milestone and is NOT in this binary.
-//! Nothing fetched from the network is ever executed.
+//! This is a reference implementation: deterministic tokenization
+//! (reference or BPE), heuristic scoring, and a small neural trainer
+//! (from scratch, CPU, std-only) with the n-gram trainer kept as an
+//! alternative. GPU acceleration is a later milestone, NOT in this
+//! binary. Nothing fetched from the network is ever executed.
 
 mod bpe;
 mod engine;
 mod fetch;
+mod neural;
 mod json;
 mod scoring;
 mod sha256;
@@ -63,11 +65,13 @@ fn usage() -> String {
      \x20 prune     [--shard <n>] [--num-shards <n>] [--max-depth <n>] [--tau <f>]\n\
      \x20 reduce    [--max-depth <n>]\n\
      \x20 train     [--order <n>] [--steps <n>]  (steps 0 = unlimited)\n\
+     \x20             [--trainer neural|ngram] [--epochs <n>] [--lr <f>]\n\
      \x20 evaluate  [--model <path>] [--probe-dir <dir>]\n\
      \x20 checkpoint\n\
      \x20 cycle     --corpus <dir> [--probe-dir <dir>] [--order <n>]\n\
      \x20             [--max-depth <n>] [--steps <n>]\n\
      \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
+     \x20             [--trainer neural|ngram] [--epochs <n>] [--lr <f>]\n\
      \x20 tokenizer train-bpe --corpus <dir> [--merges <n>] [--out <file>]\n\
      \x20 tokenizer encode --merges <file> --text <text>\n\
      \x20 tokenizer decode --merges <file> --tokens <hex...>\n"
@@ -174,6 +178,9 @@ fn run() -> Result<(), String> {
                 &engine::TrainArgs {
                     order: args.get_usize("order", 0),
                     steps: args.get_usize("steps", 100),
+                    trainer: args.get("trainer"),
+                    epochs: args.get_usize("epochs", 0),
+                    lr: args.get_f64("lr").unwrap_or(0.0),
                 },
             )?;
             Ok(())
@@ -181,6 +188,7 @@ fn run() -> Result<(), String> {
         "evaluate" => {
             engine::cmd_evaluate(
                 &root,
+                &config,
                 &engine::EvaluateArgs { model_path: args.get("model"), probe_dir: args.get("probe-dir") },
             )?;
             Ok(())
@@ -202,6 +210,9 @@ fn run() -> Result<(), String> {
                     steps: args.get_usize("steps", 0),
                     tokenizer: args.get("tokenizer"),
                     bpe_merges: args.get("bpe-merges"),
+                    trainer: args.get("trainer"),
+                    epochs: args.get_usize("epochs", 0),
+                    lr: args.get_f64("lr").unwrap_or(0.0),
                 },
             )?;
             Ok(())

@@ -34,13 +34,15 @@ it. Workflows use `GITHUB_TOKEN` only.
   there are no API keys, no cloud credentials, and no model
   registry logins in any job. If a future step needs one, it
   belongs in GitHub Actions secrets, never in a file.
-- Network: the runner needs outbound HTTPS to github.com (and, for
-  the neural milestone, to wherever the base model comes from).
-  It needs no inbound ports.
-- The reference trainer runs on CPU inside the GPU job today
-  (proving the slot works). The neural trainer that plugs into
-  this slot later will need CUDA on the box; that is a hardware
-  setup step (drivers + container runtime), not a repo change.
+- Network: the runner needs outbound HTTPS to github.com. It needs
+  no inbound ports. (An earlier draft mentioned fetching a base
+  model for the neural milestone; that is gone: the neural trainer
+  trains from scratch, no pretrained weights are fetched.)
+- The neural trainer runs on CPU inside the GPU job today
+  (proving the slot works; it is the same CPU trainer as the
+  `train` job). GPU acceleration of that trainer later will need
+  CUDA on the box; that is a hardware setup step (drivers +
+  container runtime), not a repo change.
 
 ## If the GPU job stays queued
 

@@ -18,6 +18,7 @@
 
 use crate::bpe::Bpe;
 use crate::fetch;
+use crate::neural;
 use crate::json::{self, Value};
 use crate::scoring::{self, Weights};
 use crate::sha256;
@@ -52,6 +53,9 @@ pub struct Config {
     pub shingle_n: usize,
     pub tokenizer: String,
     pub bpe_merges: String,
+    pub trainer: String,
+    pub neural_epochs: usize,
+    pub neural_lr: f64,
 }
 
 impl Default for Config {
@@ -81,6 +85,9 @@ impl Default for Config {
             shingle_n: 5,
             tokenizer: "reference".to_string(),
             bpe_merges: "state/bpe.json".to_string(),
+            trainer: "neural".to_string(),
+            neural_epochs: 100,
+            neural_lr: 0.01,
         }
     }
 }
@@ -137,6 +144,13 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
             .and_then(|x| x.as_str())
             .unwrap_or(&d.bpe_merges)
             .to_string(),
+        trainer: v
+            .get("trainer")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&d.trainer)
+            .to_string(),
+        neural_epochs: get_usize(&v, "neural_epochs", d.neural_epochs).max(1),
+        neural_lr: get_f64(&v, "neural_lr", d.neural_lr),
     })
 }
 
@@ -902,12 +916,28 @@ pub fn heldout(sha: &str) -> bool {
 pub struct TrainArgs {
     pub order: usize,
     pub steps: usize, // 0 = unlimited; otherwise max retained docs consumed
+    pub trainer: Option<String>,
+    pub epochs: usize, // 0 = config default (neural only)
+    pub lr: f64,       // 0.0 = config default (neural only)
+}
+
+/// Train dispatch: neural (default) or n-gram. Both write
+/// state/model-next.json through the same checkpoint/gating
+/// interface. An unknown trainer name is an error, never a silent
+/// fallback to the other trainer.
+pub fn cmd_train(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, String> {
+    let trainer = a.trainer.clone().unwrap_or_else(|| config.trainer.clone());
+    match trainer.as_str() {
+        "neural" => cmd_train_neural(root, config, a),
+        "ngram" => cmd_train_ngram(root, config, a),
+        other => Err(format!("unknown trainer '{}' (want 'neural' or 'ngram')", other)),
+    }
 }
 
 /// Train the reference n-gram model: merge prior checkpoint counts
 /// (count-space replay: old knowledge persists) with new counts from
 /// retained, non-held-out docs. Writes state/model-next.json.
-pub fn cmd_train(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, String> {
+pub fn cmd_train_ngram(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, String> {
     let order = if a.order == 0 { config.ngram_order } else { a.order };
     let reduced = read_json(&root.join("state/reduced.json"))
         .or_else(|_| read_json(&root.join("state/prune.json")))?;
@@ -956,7 +986,15 @@ pub fn cmd_train(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, S
                         }
                     }
                 }
-                total_tokens = model.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+                // Only inherit the token denominator when the prior
+                // model actually carries n-gram counts. A neural
+                // prior's total_tokens counts doc tokens, not
+                // n-gram events; adopting it would halve every
+                // unigram probability (counts sum to the new epoch
+                // only, denominator to both epochs).
+                if model.get("counts").and_then(|x| x.as_arr()).is_some() {
+                    total_tokens = model.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+                }
                 if let Some(ds) = model.get("doc_shas").and_then(|x| x.as_arr()) {
                     prior_docs = ds.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
                 }
@@ -1047,6 +1085,124 @@ pub fn cmd_train(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, S
         trained_docs.len(),
         new_tokens,
         total_tokens
+    );
+    Ok(model)
+}
+
+/// Train the neural model (see neural.rs for the exact
+/// architecture): from scratch, or init-from-prior-checkpoint when
+/// a prior neural checkpoint exists, plus replay of the prior
+/// checkpoint's training docs. Held-out docs are never trained on.
+/// Writes state/model-next.json with kind "neural".
+pub fn cmd_train_neural(root: &Path, config: &Config, a: &TrainArgs) -> Result<Value, String> {
+    let epochs = if a.epochs == 0 { config.neural_epochs } else { a.epochs };
+    let lr = if a.lr == 0.0 { config.neural_lr } else { a.lr };
+    let reduced = read_json(&root.join("state/reduced.json"))
+        .or_else(|_| read_json(&root.join("state/prune.json")))?;
+    let retained = reduced.get("retained").and_then(|x| x.as_arr()).cloned().unwrap_or_default();
+    let mut shas: Vec<String> = retained
+        .iter()
+        .filter_map(|r| r.get("sha256").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .collect();
+    shas.sort();
+    let docs = load_docs(root)?;
+    let by_sha: HashMap<String, Doc> = docs.into_iter().map(|d| (d.sha.clone(), d)).collect();
+
+    // Prior neural checkpoint, if any (weights + replay doc list).
+    let mut prior_vocab: Option<Vec<String>> = None;
+    let mut prior_params: Option<Vec<f64>> = None;
+    let mut prior_docs: Vec<String> = Vec::new();
+    if let Ok(current) = read_json(&root.join("state/current.json")) {
+        if let Some(ver) = current.get("version").and_then(|x| x.as_str()) {
+            let model_path = root.join("checkpoints").join(ver).join("model.json");
+            if let Ok(model) = read_json(&model_path) {
+                if let Ok((pv, pp)) = neural::model_from_json(&model) {
+                    prior_vocab = Some(pv);
+                    prior_params = Some(pp);
+                }
+                if let Some(ds) = model.get("doc_shas").and_then(|x| x.as_arr()) {
+                    prior_docs = ds.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                }
+            }
+        }
+    }
+
+    // New docs: retained, non-held-out, steps-limited.
+    let limit = if a.steps == 0 { usize::MAX } else { a.steps };
+    let mut new_docs: Vec<String> = Vec::new();
+    for sha in &shas {
+        if new_docs.len() >= limit {
+            break;
+        }
+        if heldout(sha) {
+            continue;
+        }
+        if by_sha.contains_key(sha) {
+            new_docs.push(sha.clone());
+        }
+    }
+    // Replay docs: prior training docs still present, non-held-out.
+    let mut train_shas = new_docs.clone();
+    for sha in &prior_docs {
+        if !heldout(sha) && by_sha.contains_key(sha) && !train_shas.contains(sha) {
+            train_shas.push(sha.clone());
+        }
+    }
+    train_shas.sort();
+
+    // Model vocabulary: "<s>" first, then data/vocab.json order,
+    // then any training-doc token missing from it (first-seen over
+    // sorted shas). Deterministic; guarantees no unknown tokens in
+    // the training set.
+    let mut vocab: Vec<String> = vec!["<s>".to_string()];
+    if let Ok(v) = read_json(&root.join("data/vocab.json")) {
+        if let Some(toks) = v.get("tokens").and_then(|x| x.as_arr()) {
+            for t in toks {
+                if let Some(s) = t.as_str() {
+                    if !vocab.contains(&s.to_string()) {
+                        vocab.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for sha in &train_shas {
+        for tok in &by_sha[sha].tokens {
+            if !vocab.contains(tok) {
+                vocab.push(tok.clone());
+            }
+        }
+    }
+    let index: HashMap<String, usize> =
+        vocab.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
+    let mut seqs: Vec<Vec<usize>> = Vec::new();
+    let mut total_tokens: i64 = 0;
+    for sha in &train_shas {
+        let doc = &by_sha[sha];
+        total_tokens += doc.tokens.len() as i64;
+        let (ids, _) = neural::tokens_to_ids(&index, &doc.tokens);
+        seqs.push(ids);
+    }
+    let examples = neural::examples_from_ids(&seqs);
+    let layout = neural::Layout::new(vocab.len());
+    let params0 = match (&prior_vocab, &prior_params) {
+        (Some(pv), Some(pp)) => neural::init_from_prior(&vocab, pv, pp, neural::SEED),
+        _ => neural::init_params(vocab.len(), neural::SEED),
+    };
+    let init_loss = neural::mean_loss(&params0, &layout, &examples);
+    let params = neural::train_adam(params0, &layout, &examples, epochs, lr, 0.9, 0.999, 1e-8);
+    let final_loss = neural::mean_loss(&params, &layout, &examples);
+    let model = neural::model_to_json(&vocab, &params, train_shas.len(), &train_shas, total_tokens);
+    write_json(&root.join("state/model-next.json"), &model)?;
+    println!(
+        "train: trainer=neural epochs={} lr={} new_docs={} replay_docs={} params={} train_loss={:.4} (init {:.4}) -> state/model-next.json",
+        epochs,
+        lr,
+        new_docs.len(),
+        train_shas.len() - new_docs.len(),
+        layout.total,
+        final_loss,
+        init_loss
     );
     Ok(model)
 }
@@ -1142,14 +1298,149 @@ fn cross_entropy(model: &EvalModel, docs_tokens: &[Vec<String>]) -> (f64, i64) {
     }
 }
 
+/// Tokenize probe text with the run's tokenizer: the registry's
+/// "tokenizer" field when present (BPE needs the merges file and
+/// fails closed without it), reference when no registry exists
+/// (e.g. shard-job contexts that never ran ingest locally).
+fn probe_tokenize(root: &Path, config: &Config, text: &str) -> Result<Vec<String>, String> {
+    let name = read_json(&root.join("state/registry.json"))
+        .ok()
+        .and_then(|r| r.get("tokenizer").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "reference".to_string());
+    match name.as_str() {
+        "bpe" => {
+            let bpe = Bpe::load_file(&root.join(&config.bpe_merges))?;
+            Ok(bpe.encode_hex(text))
+        }
+        _ => Ok(tokenizer::tokenize(text)),
+    }
+}
+
+/// Evaluate a neural candidate model on the held-out split and the
+/// probe set. Same output shape as the n-gram path, so the
+/// checkpoint gate is unchanged across trainers.
+fn cmd_evaluate_neural(
+    root: &Path,
+    config: &Config,
+    a: &EvaluateArgs,
+    model_json: &Value,
+) -> Result<Value, String> {
+    let (vocab, params) = neural::model_from_json(model_json)?;
+    let layout = neural::Layout::new(vocab.len());
+    let index: HashMap<String, usize> =
+        vocab.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
+    let reduced = read_json(&root.join("state/reduced.json"))
+        .or_else(|_| read_json(&root.join("state/prune.json")))?;
+    let retained = reduced.get("retained").and_then(|x| x.as_arr()).cloned().unwrap_or_default();
+    let shas: Vec<String> = retained
+        .iter()
+        .filter_map(|r| r.get("sha256").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .collect();
+    let docs = load_docs(root)?;
+    let by_sha: HashMap<String, Doc> = docs.into_iter().map(|d| (d.sha.clone(), d)).collect();
+    let mut held_seqs: Vec<Vec<usize>> = Vec::new();
+    let mut held_unknown = 0usize;
+    for s in shas.iter().filter(|s| heldout(s)) {
+        if let Some(d) = by_sha.get(s) {
+            let (ids, unk) = neural::tokens_to_ids(&index, &d.tokens);
+            held_seqs.push(ids);
+            held_unknown += unk;
+        }
+    }
+    let (heldout_loss, heldout_n) = neural::neural_cross_entropy(&params, &layout, &held_seqs, held_unknown);
+    let (probe_loss, probe_n) = eval_probe_neural(root, config, a, &index, &params, &layout)?;
+    let mut out = Value::obj();
+    if heldout_n > 0 {
+        out.put("heldout_loss", Value::f(heldout_loss));
+        out.put("perplexity", Value::f(heldout_loss.exp()));
+    } else {
+        out.put("heldout_loss", Value::Null);
+        out.put("perplexity", Value::Null);
+    }
+    out.put("heldout_tokens", Value::n(heldout_n));
+    out.put("probe_loss", probe_loss);
+    out.put("probe_tokens", Value::n(probe_n));
+    write_json(&root.join("state/evaluation.json"), &out)?;
+    println!(
+        "evaluate: trainer=neural heldout_loss={} perplexity={} probe_loss={} -> state/evaluation.json",
+        match out.get("heldout_loss").and_then(|x| x.as_f64()) {
+            Some(l) => format!("{:.4}", l),
+            None => "null (no held-out docs)".to_string(),
+        },
+        match out.get("perplexity").and_then(|x| x.as_f64()) {
+            Some(p) => format!("{:.2}", p),
+            None => "null".to_string(),
+        },
+        match out.get("probe_loss").and_then(|x| x.as_f64()) {
+            Some(l) => format!("{:.4}", l),
+            None => "null".to_string(),
+        }
+    );
+    Ok(out)
+}
+
+fn eval_probe_neural(
+    root: &Path,
+    config: &Config,
+    a: &EvaluateArgs,
+    index: &HashMap<String, usize>,
+    params: &[f64],
+    layout: &neural::Layout,
+) -> Result<(Value, i64), String> {
+    let probe_dir = match &a.probe_dir {
+        Some(p) => Some(PathBuf::from(p)),
+        None => {
+            let p = root.join("probe");
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
+        }
+    };
+    let mut probe_loss = Value::Null;
+    let mut probe_n = 0i64;
+    if let Some(dir) = probe_dir {
+        let mut files: Vec<PathBuf> = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let p = entry.path();
+                if p.extension().map(|e| e == "txt").unwrap_or(false) {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        let mut seqs: Vec<Vec<usize>> = Vec::new();
+        let mut unknown = 0usize;
+        for p in files {
+            let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+            let toks = probe_tokenize(root, config, &text)?;
+            let (ids, unk) = neural::tokens_to_ids(index, &toks);
+            seqs.push(ids);
+            unknown += unk;
+        }
+        let (loss, n) = neural::neural_cross_entropy(params, layout, &seqs, unknown);
+        probe_loss = Value::f(loss);
+        probe_n = n;
+    }
+    Ok((probe_loss, probe_n))
+}
+
 /// Evaluate the candidate model on the held-out split and the probe
-/// set. Writes state/evaluation.json.
-pub fn cmd_evaluate(root: &Path, a: &EvaluateArgs) -> Result<Value, String> {
+/// set. Writes state/evaluation.json. Dispatches on model kind:
+/// neural models take the neural path, anything else the n-gram
+/// path (the original format carries no kind field).
+pub fn cmd_evaluate(root: &Path, config: &Config, a: &EvaluateArgs) -> Result<Value, String> {
     let model_path = match &a.model_path {
         Some(p) => PathBuf::from(p),
         None => root.join("state/model-next.json"),
     };
     let model_json = read_json(&model_path)?;
+    if model_json.get("kind").and_then(|x| x.as_str()) == Some("neural") {
+        return cmd_evaluate_neural(root, config, a, &model_json);
+    }
     let model = load_eval_model(&model_json);
     let reduced = read_json(&root.join("state/reduced.json"))
         .or_else(|_| read_json(&root.join("state/prune.json")))?;
@@ -1196,7 +1487,7 @@ pub fn cmd_evaluate(root: &Path, a: &EvaluateArgs) -> Result<Value, String> {
         let mut probe_docs: Vec<Vec<String>> = Vec::new();
         for p in files {
             let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-            probe_docs.push(tokenizer::tokenize(&text));
+            probe_docs.push(probe_tokenize(root, config, &text)?);
         }
         let (loss, n) = cross_entropy(&model, &probe_docs);
         probe_loss = Value::f(loss);
@@ -1371,6 +1662,9 @@ pub struct CycleArgs {
     pub steps: usize,
     pub tokenizer: Option<String>,
     pub bpe_merges: Option<String>,
+    pub trainer: Option<String>,
+    pub epochs: usize,
+    pub lr: f64,
 }
 
 /// Run the full bounded cycle locally: ingest -> prune -> reduce ->
@@ -1400,9 +1694,14 @@ pub fn cmd_cycle(root: &Path, config: &Config, a: &CycleArgs) -> Result<Value, S
     let tau = prune_out.json.get("tau").and_then(|x| x.as_f64()).unwrap_or(0.0);
     println!("cycle: prune retained {} docs at tau {:.3}", prune_out.retained_shas.len(), tau);
     cmd_reduce(root, &ReduceArgs { max_depth: a.max_depth })?;
-    cmd_train(root, config, &TrainArgs { order: a.order, steps: a.steps })?;
+    cmd_train(
+        root,
+        config,
+        &TrainArgs { order: a.order, steps: a.steps, trainer: a.trainer.clone(), epochs: a.epochs, lr: a.lr },
+    )?;
     cmd_evaluate(
         root,
+        config,
         &EvaluateArgs { model_path: None, probe_dir: a.probe_dir.clone() },
     )?;
     let manifest = cmd_checkpoint(root, config)?;
@@ -1600,6 +1899,9 @@ mod tests {
                 steps: 0,
                 tokenizer: None,
                 bpe_merges: None,
+                trainer: None,
+                epochs: 0,
+                lr: 0.0,
             },
         )
         .unwrap();
