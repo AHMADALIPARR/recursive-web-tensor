@@ -13,14 +13,20 @@ reduce  (needs process, 30 min, contents:read)
   reduce --max-depth 8
   upload artifact reduced (state/reduced.json, 30 days)
         |
-train   (needs reduce, 45 min, contents:read)
+prune-global (needs reduce, 30 min, contents:read)
+  re-ingest full corpus (deterministic; provides the docs compared)
+  download reduced -> state/reduced.json
+  prune-global --num-shards 4
+  upload artifact reduced-global (state/reduced.json, 30 days)
+        |
+train   (needs prune-global, 45 min, contents:read)
   restore state/ + checkpoints/ from rwt-state branch
   re-ingest full corpus (deterministic)
-  download reduced -> state/reduced.json
+  download reduced-global -> state/reduced.json
   train --steps 100
   upload artifact model-next (state/model-next.json, 30 days)
         |
-train-gpu (needs reduce, [self-hosted, gpu], 360 min, contents:read)
+train-gpu (needs prune-global, [self-hosted, gpu], 360 min, contents:read)
   ONLY on workflow_dispatch with gpu input true. Schedule runs
   never start it. Runs the same CLI train command on the GPU
   runner slot and uploads model-next-gpu as an artifact ONLY.
@@ -28,14 +34,14 @@ train-gpu (needs reduce, [self-hosted, gpu], 360 min, contents:read)
         |
 evaluate (needs train, 30 min, contents:read)
   re-ingest full corpus
-  download reduced + model-next
+  download reduced-global + model-next
   evaluate --probe-dir fixtures/probe
   upload artifact evaluation (state/evaluation.json, 90 days)
         |
 publish (needs evaluate, 30 min, contents:write)
   restore state/ + checkpoints/ from rwt-state branch
   re-ingest full corpus
-  download reduced + model-next + evaluation
+  download reduced-global + model-next + evaluation
   checkpoint            <- the ONLY checkpoint write in the system
   upload artifact checkpoint (checkpoints/, 90 days)
   commit state/ + checkpoints/ to the rwt-state branch

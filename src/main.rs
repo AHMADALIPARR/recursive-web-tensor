@@ -12,6 +12,7 @@
 mod bpe;
 mod engine;
 mod fetch;
+mod minhash;
 mod neural;
 mod warc;
 mod json;
@@ -67,6 +68,7 @@ fn usage() -> String {
      \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
      \x20 prune     [--shard <n>] [--num-shards <n>] [--max-depth <n>] [--tau <f>]\n\
      \x20 reduce    [--max-depth <n>]\n\
+     \x20 prune-global [--num-shards <n>]\n\
      \x20 train     [--order <n>] [--steps <n>]  (steps 0 = unlimited)\n\
      \x20             [--trainer neural|ngram] [--epochs <n>] [--lr <f>]\n\
      \x20 evaluate  [--model <path>] [--probe-dir <dir>]\n\
@@ -176,6 +178,10 @@ fn run() -> Result<(), String> {
         }
         "reduce" => {
             engine::cmd_reduce(&root, &engine::ReduceArgs { max_depth: args.get_usize("max-depth", 8) })?;
+            Ok(())
+        }
+        "prune-global" => {
+            engine::cmd_prune_global(&root, &config, args.get_usize("num-shards", 4))?;
             Ok(())
         }
         "train" => {

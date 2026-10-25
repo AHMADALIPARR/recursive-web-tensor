@@ -6,7 +6,7 @@ set -eu
 BIN="${1:-./target/release/internet-token-engine}"
 ROOT="$(pwd)"
 WORK="$(mktemp -d /tmp/rwt-e2e-XXXXXX)"
-trap 'if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null; fi; rm -rf "$WORK" ${WORK4:-}' EXIT
+trap 'if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null; fi; rm -rf "$WORK" ${WORK4:-} ${WORK5:-}' EXIT
 echo "work dir: $WORK"
 
 # Default path: neural trainer (Phase 3). The verify block below
@@ -161,3 +161,67 @@ kill "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 rm -rf "$WORK4"
 WORK4=""
+
+echo "=== Global pruning path (Phase 5: shard-local misses, global catches) ==="
+WORK5="$(mktemp -d /tmp/rwt-e2e-global-XXXXXX)"
+python3 - "$WORK5" <<'EOF'
+import sys
+work = sys.argv[1]
+import os
+os.makedirs(f"{work}/corpus", exist_ok=True)
+base = ("The river flows through the valley while morning mist hangs over the water and birds sing in the trees. "
+        "Mountains rise beyond the forest and snow covers the highest peaks through the winter months. "
+        "Farmers plant their fields in spring and harvest the grain when summer ends and autumn begins. "
+        "The old lighthouse stands on the cliff above the harbor and guides ships safely home at night. "
+        "Children play in the garden while their parents prepare dinner in the warm kitchen nearby. ")
+for i in range(10):
+    open(f"{work}/corpus/fam{i}.txt", "w").write(base + f" z{i}\n")
+open(f"{work}/corpus/solo.txt", "w").write(
+    "Quantum entanglement links particles across vast distances in ways that defy classical intuition completely. "
+    "Laboratories test Bell inequalities with photons and ions to confirm the strange predictions of theory.\n")
+EOF
+"$BIN" --root "$WORK5" ingest --corpus "$WORK5/corpus"
+for s in 0 1 2 3; do "$BIN" --root "$WORK5" prune --shard $s --num-shards 4 --max-depth 8; done
+"$BIN" --root "$WORK5" reduce --max-depth 8
+"$BIN" --root "$WORK5" prune-global --num-shards 4
+python3 - "$WORK5" <<'EOF'
+import glob, hashlib, json, sys
+work = sys.argv[1]
+red = json.load(open(f"{work}/state/reduced.json"))
+kept = [r["sha256"] for r in red["retained"]]
+assert len(kept) == 2, f"expected 2 retained after global prune, got {len(kept)}"
+pruned = red["global_pruned"]
+assert len(pruned) == 3, f"expected 3 demoted, got {len(pruned)}"
+mh = red["global_minhash"]
+assert mh["cross_shard_demoted"] == 3 and mh["same_shard_demoted"] == 0, mh
+# Every demoted doc aliases to the same surviving family canonical,
+# which is the lowest family SHA; the solo doc survives.
+shards = {}
+for path in glob.glob(f"{work}/data/shards/*.json"):
+    d = json.load(open(path))
+    shards[d["sha256"]] = d["text"]
+fam_kept = [s for s in kept if "lighthouse" in shards[s]]
+assert len(fam_kept) == 1, fam_kept
+canon = fam_kept[0]
+assert canon == min(s for s in shards if "lighthouse" in shards[s] and s in kept + [p["sha256"] for p in pruned]), "canonical must be lowest SHA among the shard canonicals"
+for p in pruned:
+    assert p["alias_of"] == canon and p["jaccard"] >= 0.9, p
+assert any("entanglement" in shards[s] for s in kept), "solo must survive"
+# Merkle root recomputed independently over the kept set.
+level = [bytes.fromhex(h) for h in sorted(kept)]
+while len(level) > 1:
+    nxt = []
+    i = 0
+    while i < len(level):
+        if i + 1 < len(level):
+            nxt.append(hashlib.sha256(level[i] + level[i + 1]).digest())
+            i += 2
+        else:
+            nxt.append(level[i])
+            i += 1
+    level = nxt
+assert level[0].hex() == red["merkle_root"], "merkle mismatch after global prune"
+print(f"Global verify OK: 3 cross-shard demoted to {canon[:8]}, solo survives, merkle recomputed")
+EOF
+rm -rf "$WORK5"
+WORK5=""

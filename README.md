@@ -56,7 +56,6 @@ today.
 ## What does NOT exist yet
 
 - Internet-scale ingestion (see Phase 1 below).
-- Global pruning (MinHash/LSH).
 - GPU training (the GPU runner slot runs the CPU trainer today).
 - A registered self-hosted GPU runner (owner's hardware step).
 - 100 million tokens processed. That number is a **target**, and the
@@ -94,10 +93,13 @@ Rules that keep this sound:
   re-ingest the corpus instead of shipping shard blobs between
   jobs. Ingest is deterministic (SHA-sorted, content-addressed),
   so the re-ingested corpus matches the sharded one.
-- **Shard-local pruning is an approximation.** Each shard prunes
-  only its own docs, so a near-duplicate pair split across shards
-  can both survive. Exact duplicates cannot (same SHA = same
-  shard). Global pruning is a later milestone, not claimed.
+- **Shard-local pruning was an approximation; global pruning closes
+  it.** Each shard prunes only its own docs, so a near-duplicate
+  pair split across shards could both survive (exact duplicates
+  never could: same SHA = same shard). The `prune-global` step
+  (MinHash/LSH candidates, exact-Jaccard verification) now runs
+  after `reduce` and before `train`, in the cycle and in the
+  workflow. See `docs/global-pruning.md`.
 - **Size discipline.** The `rwt-state` branch holds manifests,
   metrics, and small state only. Never commit large model files to
   main or to the state branch; model files travel as artifacts
@@ -210,10 +212,12 @@ promote at all.
   training-compute entitlement**. The bounded-cycle design exists
   because of this limit, not in spite of it.
 - The reference trainer is O(corpus) per epoch with O(n^2)
-  shingle comparisons inside prune (shard-local). That is fine at
-  reference scale and a known wall at internet scale; the
-  production path needs shingle indexing (e.g. MinHash/LSH), which
-  is a later milestone, not a hidden assumption.
+  shingle comparisons inside shard-local prune. That is fine at
+  reference scale and a known wall at internet scale; the global
+  step already uses shingle indexing (MinHash/LSH) instead of
+  O(n^2) comparison — see `docs/global-pruning.md` — but
+  shard-local prune itself is still O(n^2) per shard, and that
+  remains the wall to watch.
 
 ## Phase 1 target: 100 MILLION TOKENS
 
@@ -262,7 +266,7 @@ Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
 ## Layout
 
 ```
-cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,scoring,sha256,json,fetch,warc}.rs
+cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,minhash,scoring,sha256,json,fetch,warc}.rs
 .github/workflows/rwt-cycle.yml   Actions control plane
 docs/                              architecture, scoring, runners
 sources/                           discovery families + license policy

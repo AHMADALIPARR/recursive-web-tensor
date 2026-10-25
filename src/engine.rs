@@ -18,6 +18,7 @@
 
 use crate::bpe::Bpe;
 use crate::fetch;
+use crate::minhash;
 use crate::neural;
 use crate::json::{self, Value};
 use crate::scoring::{self, Weights};
@@ -56,6 +57,9 @@ pub struct Config {
     pub trainer: String,
     pub neural_epochs: usize,
     pub neural_lr: f64,
+    pub minhash_permutations: usize,
+    pub lsh_bands: usize,
+    pub lsh_rows: usize,
 }
 
 impl Default for Config {
@@ -88,6 +92,9 @@ impl Default for Config {
             trainer: "neural".to_string(),
             neural_epochs: 100,
             neural_lr: 0.01,
+            minhash_permutations: 128,
+            lsh_bands: 16,
+            lsh_rows: 8,
         }
     }
 }
@@ -151,6 +158,9 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
             .to_string(),
         neural_epochs: get_usize(&v, "neural_epochs", d.neural_epochs).max(1),
         neural_lr: get_f64(&v, "neural_lr", d.neural_lr),
+        minhash_permutations: get_usize(&v, "minhash_permutations", d.minhash_permutations).max(1),
+        lsh_bands: get_usize(&v, "lsh_bands", d.lsh_bands).max(1),
+        lsh_rows: get_usize(&v, "lsh_rows", d.lsh_rows).max(1),
     })
 }
 
@@ -1013,6 +1023,144 @@ pub fn cmd_reduce(root: &Path, a: &ReduceArgs) -> Result<Value, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------- prune-global
+
+/// Global near-dup pruning over the reduced set: finds cross-shard
+/// near-dup pairs the shard-local prune passes missed (and, as a
+/// safety net, any same-shard pair that survived), using MinHash +
+/// LSH candidates verified with exact Jaccard. Demoted docs become
+/// Compress with alias_of = lowest-SHA canonical, consistent with
+/// shard-local prune; the retained list, token total, and Merkle
+/// root in state/reduced.json are recomputed, and full detail is
+/// written to state/prune-global.json. Requires state/reduced.json
+/// (run reduce first). Retained docs missing from disk are kept
+/// retained and counted as unverified, never silently dropped.
+pub fn cmd_prune_global(root: &Path, config: &Config, num_shards: usize) -> Result<Value, String> {
+    if config.lsh_bands * config.lsh_rows != config.minhash_permutations {
+        return Err(format!(
+            "lsh_bands ({}) * lsh_rows ({}) != minhash_permutations ({})",
+            config.lsh_bands, config.lsh_rows, config.minhash_permutations
+        ));
+    }
+    let mut reduced = read_json(&root.join("state/reduced.json"))?;
+    let retained = reduced.get("retained").and_then(|x| x.as_arr()).cloned().unwrap_or_default();
+    let mut shas: Vec<String> = retained
+        .iter()
+        .filter_map(|r| r.get("sha256").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .collect();
+    shas.sort();
+    let token_count: HashMap<String, i64> = retained
+        .iter()
+        .filter_map(|r| {
+            let sha = r.get("sha256").and_then(|x| x.as_str())?;
+            let tc = r.get("token_count").and_then(|x| x.as_i64()).unwrap_or(0);
+            Some((sha.to_string(), tc))
+        })
+        .collect();
+    let docs = load_docs(root)?;
+    let by_sha: HashMap<String, Doc> = docs.into_iter().map(|d| (d.sha.clone(), d)).collect();
+
+    let mut sets: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut unverified = 0usize;
+    for sha in &shas {
+        match by_sha.get(sha) {
+            Some(d) => sets.push((sha.clone(), tokenizer::shingles(&d.tokens, config.shingle_n))),
+            None => unverified += 1,
+        }
+    }
+    let (decisions, candidates) = minhash::lsh_decisions(
+        &sets,
+        config.near_dup_threshold,
+        config.minhash_permutations,
+        config.lsh_bands,
+        config.lsh_rows,
+    );
+    let demoted: HashMap<String, (String, f64)> = decisions
+        .iter()
+        .map(|(sha, canon, jacc)| (sha.clone(), (canon.clone(), *jacc)))
+        .collect();
+    // Reporting split only: demotion itself is shard-agnostic.
+    // num_shards is the workflow matrix width (4); the cycle passes
+    // the same 4 it uses for ingest/prune.
+    let mut cross_shard = 0usize;
+    let mut same_shard = 0usize;
+    for (sha, (canon, _)) in &demoted {
+        if shard_of(sha, num_shards) == shard_of(canon, num_shards) {
+            same_shard += 1;
+        } else {
+            cross_shard += 1;
+        }
+    }
+
+    let kept: Vec<String> = shas.iter().filter(|s| !demoted.contains_key(*s)).cloned().collect();
+    let merkle = sha256::merkle_root(kept.clone());
+    let total_tokens: i64 = kept.iter().map(|s| token_count.get(s).copied().unwrap_or(0)).sum();
+    let mut new_retained: Vec<Value> = Vec::new();
+    for sha in &kept {
+        let mut r = Value::obj();
+        r.put("sha256", Value::s(sha));
+        r.put("token_count", Value::n(token_count.get(sha).copied().unwrap_or(0)));
+        // Preserve the original shard list when present.
+        if let Some(orig) = retained.iter().find(|r| r.get("sha256").and_then(|x| x.as_str()) == Some(sha.as_str())) {
+            if let Some(shards) = orig.get("shards") {
+                r.put("shards", shards.clone());
+            }
+        }
+        new_retained.push(r);
+    }
+    reduced.put("retained", Value::Arr(new_retained));
+    reduced.put("merkle_root", Value::s(&merkle));
+    reduced.put("total_tokens", Value::n(total_tokens));
+    let mut global_aliases = Value::obj();
+    let mut pruned_arr: Vec<Value> = Vec::new();
+    let mut demoted_sorted: Vec<(&String, &(String, f64))> = demoted.iter().collect();
+    demoted_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (sha, (canon, jacc)) in demoted_sorted {
+        global_aliases.put(sha, Value::s(canon));
+        let mut p = Value::obj();
+        p.put("sha256", Value::s(sha));
+        p.put("alias_of", Value::s(canon));
+        p.put("jaccard", Value::f(*jacc));
+        p.put("disposition", Value::s("Compress"));
+        pruned_arr.push(p);
+    }
+    reduced.put("global_aliases", global_aliases);
+    reduced.put("global_pruned", Value::Arr(pruned_arr));
+    // Merge into resolved_aliases for consumers that only read it.
+    let mut resolved = match reduced.get("resolved_aliases") {
+        Some(Value::Obj(m)) => m.clone(),
+        _ => BTreeMap::new(),
+    };
+    for (sha, (canon, _)) in &demoted {
+        resolved.insert(sha.clone(), Value::s(canon));
+    }
+    reduced.put("resolved_aliases", Value::Obj(resolved));
+    let mut mh = Value::obj();
+    mh.put("permutations", Value::n(config.minhash_permutations as i64));
+    mh.put("bands", Value::n(config.lsh_bands as i64));
+    mh.put("rows", Value::n(config.lsh_rows as i64));
+    mh.put("threshold", Value::f(config.near_dup_threshold));
+    mh.put("candidates", Value::n(candidates as i64));
+    mh.put("verified_pairs", Value::n(decisions.len() as i64));
+    mh.put("demoted", Value::n(demoted.len() as i64));
+    mh.put("cross_shard_demoted", Value::n(cross_shard as i64));
+    mh.put("same_shard_demoted", Value::n(same_shard as i64));
+    mh.put("unverified_missing", Value::n(unverified as i64));
+    reduced.put("global_minhash", mh.clone());
+    write_json(&root.join("state/reduced.json"), &reduced)?;
+    write_json(&root.join("state/prune-global.json"), &reduced)?;
+    println!(
+        "prune-global: {} candidates, {} demoted ({} cross-shard, {} same-shard), {} unverified, retained {} -> state/reduced.json",
+        candidates,
+        demoted.len(),
+        cross_shard,
+        same_shard,
+        unverified,
+        kept.len()
+    );
+    Ok(reduced)
+}
+
 // ---------------------------------------------------------------- train
 
 pub fn heldout(sha: &str) -> bool {
@@ -1807,6 +1955,7 @@ pub fn cmd_cycle(root: &Path, config: &Config, a: &CycleArgs) -> Result<Value, S
     let tau = prune_out.json.get("tau").and_then(|x| x.as_f64()).unwrap_or(0.0);
     println!("cycle: prune retained {} docs at tau {:.3}", prune_out.retained_shas.len(), tau);
     cmd_reduce(root, &ReduceArgs { max_depth: a.max_depth })?;
+    cmd_prune_global(root, config, 4)?;
     cmd_train(
         root,
         config,
@@ -1905,6 +2054,12 @@ mod tests {
         }
     }
 
+    /// Stored text of the shard file for a SHA (test helper).
+    fn by_sha_text(root: &Path, sha: &str) -> String {
+        let v = read_json(&root.join("data/shards").join(format!("{}.json", sha))).unwrap();
+        v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string()
+    }
+
     #[test]
     fn adaptive_tau_rules() {
         let c = Config::default();
@@ -1969,6 +2124,96 @@ mod tests {
         assert!(kinds.contains("Compress"), "kinds: {:?}", kinds);
         assert!(kinds.contains("Quarantine"), "kinds: {:?}", kinds);
         assert!(kinds.contains("Reject"), "kinds: {:?}", kinds);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_global_finds_cross_shard_pairs() {
+        // Ten near-dup family docs (base + one distinct trailing
+        // token each; shingle Jaccard ~0.98) spread across all four
+        // shards, plus one distinct doc. Shard-local prune keeps one
+        // canonical per shard; reduce keeps five; prune-global must
+        // collapse the family to its lowest SHA and keep the solo
+        // doc, with all demotions cross-shard.
+        let root = tmp_root("prune-global");
+        let base = "The river flows through the valley while morning mist hangs over the water and birds sing in the trees. Mountains rise beyond the forest and snow covers the highest peaks through the winter months. Farmers plant their fields in spring and harvest the grain when summer ends and autumn begins. The old lighthouse stands on the cliff above the harbor and guides ships safely home at night. Children play in the garden while their parents prepare dinner in the warm kitchen nearby. ";
+        let mut docs: Vec<(String, String)> = Vec::new();
+        for i in 0..10 {
+            docs.push((format!("fam{}.txt", i), format!("{} z{}", base, i)));
+        }
+        docs.push((
+            "solo.txt".to_string(),
+            "Quantum entanglement links particles across vast distances in ways that defy classical intuition completely. Laboratories test Bell inequalities with photons and ions to confirm the strange predictions of theory.".to_string(),
+        ));
+        let refs: Vec<(&str, &str)> =
+            docs.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        write_corpus(&root, &refs);
+        let cfg = Config::default();
+        cmd_ingest(
+            &root,
+            &IngestArgs { corpus: Some(root.join("corpus").to_string_lossy().into_owned()), url_manifest: None, cc_index: None, cc_warc_manifest: None, cc_data_base: None, cc_max_records: 0, ddg_query: None, shard: None, num_shards: 4, tokenizer: None, bpe_merges: None, config: cfg.clone() },
+        )
+        .unwrap();
+        // Family members must actually land in more than one shard,
+        // or the test proves nothing about cross-shard detection.
+        let all = load_docs(&root).unwrap();
+        let mut fam_shards: HashSet<usize> = HashSet::new();
+        for d in &all {
+            if d.text.contains(" z") && d.text.contains("lighthouse") {
+                fam_shards.insert(shard_of(&d.sha, 4));
+            }
+        }
+        assert!(fam_shards.len() > 1, "family must span shards: {:?}", fam_shards);
+        for s in 0..4 {
+            cmd_prune(&root, &cfg, &PruneArgs { shard: Some(s), num_shards: 4, max_depth: 8, tau_override: None }).unwrap();
+        }
+        cmd_reduce(&root, &ReduceArgs { max_depth: 8 }).unwrap();
+        let before = read_json(&root.join("state/reduced.json")).unwrap();
+        let retained_before = before.get("retained").and_then(|x| x.as_arr()).unwrap().len();
+        assert_eq!(retained_before, 5, "shard prune + reduce must retain 4 family canonicals + solo");
+        let after = cmd_prune_global(&root, &cfg, 4).unwrap();
+        let retained = after.get("retained").and_then(|x| x.as_arr()).unwrap();
+        assert_eq!(retained.len(), 2, "global prune must retain family canonical + solo");
+        let kept: Vec<String> = retained
+            .iter()
+            .filter_map(|r| r.get("sha256").and_then(|x| x.as_str()).map(|s| s.to_string()))
+            .collect();
+        // Merkle root recomputed over the kept set.
+        assert_eq!(
+            after.get("merkle_root").and_then(|x| x.as_str()),
+            Some(sha256::merkle_root(kept.clone()).as_str())
+        );
+        let pruned = after.get("global_pruned").and_then(|x| x.as_arr()).unwrap();
+        assert_eq!(pruned.len(), 3, "exactly 3 cross-shard demotions expected");
+        let mh = after.get("global_minhash").unwrap();
+        assert_eq!(mh.get("cross_shard_demoted").and_then(|x| x.as_i64()), Some(3));
+        assert_eq!(mh.get("same_shard_demoted").and_then(|x| x.as_i64()), Some(0));
+        // The surviving family canonical is the lowest family SHA,
+        // and every demoted doc aliases to it.
+        let fam_kept: Vec<String> = kept
+            .iter()
+            .filter(|s| {
+                by_sha_text(&root, s).contains("lighthouse")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(fam_kept.len(), 1, "exactly one family canonical must survive");
+        for p in pruned {
+            assert_eq!(
+                p.get("alias_of").and_then(|x| x.as_str()),
+                Some(fam_kept[0].as_str()),
+                "demoted doc must alias to the surviving canonical"
+            );
+            assert!(
+                p.get("jaccard").and_then(|x| x.as_f64()).unwrap_or(0.0) >= 0.9,
+                "demotion requires exact Jaccard >= 0.9"
+            );
+        }
+        // The solo doc survives.
+        assert!(
+            kept.iter().any(|s| by_sha_text(&root, s).contains("entanglement")),
+            "solo doc must survive global prune"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

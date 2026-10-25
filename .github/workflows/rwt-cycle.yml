@@ -1,9 +1,9 @@
 # RECURSIVE WEB TENSOR — one bounded epoch per run.
 #
 # Design (see docs/architecture.md):
-# - Shard jobs NEVER write the model. Only the reduce -> train ->
-#   evaluate -> publish chain touches checkpoints, and only the
-#   publish job writes them (after the validation gate).
+# - Shard jobs NEVER write the model. Only the reduce -> prune-global
+#   -> train -> evaluate -> publish chain touches checkpoints, and
+#   only the publish job writes them (after the validation gate).
 # - Persistent state lives on the `rwt-state` branch, NOT on main.
 #   Jobs restore what they need from that branch (validation trend
 #   for prune, prior checkpoint for train, current pointer + parent
@@ -84,8 +84,33 @@ jobs:
           name: reduced
           path: state/reduced.json
           retention-days: 30
-  train:
+  prune-global:
     needs: reduce
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: cargo build --release --locked
+      - name: Re-ingest full corpus (deterministic; provides the docs prune-global compares)
+        run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
+      - name: Download reduced set
+        uses: actions/download-artifact@v4
+        with:
+          name: reduced
+          path: state
+      - name: Global near-dup prune (MinHash/LSH + exact Jaccard)
+        run: ./target/release/internet-token-engine --root . prune-global --num-shards 4
+      - name: Upload globally pruned set
+        uses: actions/upload-artifact@v4
+        with:
+          name: reduced-global
+          path: state/reduced.json
+          retention-days: 30
+  train:
+    needs: prune-global
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -100,12 +125,12 @@ jobs:
         run: cargo build --release --locked
       - name: Re-ingest full corpus (deterministic; avoids shipping shard blobs)
         run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
-      - name: Download reduced set
+      - name: Download globally pruned set
         uses: actions/download-artifact@v4
         with:
-          name: reduced
+          name: reduced-global
           path: state
-      - name: Train reference model
+      - name: Train model
         run: ./target/release/internet-token-engine --root . train --steps 100
       - name: Upload candidate model
         uses: actions/upload-artifact@v4
@@ -114,7 +139,7 @@ jobs:
           path: state/model-next.json
           retention-days: 30
   train-gpu:
-    needs: reduce
+    needs: prune-global
     if: github.event_name == 'workflow_dispatch' && inputs.gpu == true
     runs-on: [self-hosted, gpu]
     timeout-minutes: 360
@@ -126,10 +151,10 @@ jobs:
         run: cargo build --release --locked
       - name: Re-ingest full corpus
         run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
-      - name: Download reduced set
+      - name: Download globally pruned set
         uses: actions/download-artifact@v4
         with:
-          name: reduced
+          name: reduced-global
           path: state
       - name: Train on the GPU runner slot (CPU neural trainer today; GPU acceleration is a later milestone)
         run: ./target/release/internet-token-engine --root . train --steps 100
@@ -151,10 +176,10 @@ jobs:
         run: cargo build --release --locked
       - name: Re-ingest full corpus
         run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
-      - name: Download reduced set
+      - name: Download globally pruned set
         uses: actions/download-artifact@v4
         with:
-          name: reduced
+          name: reduced-global
           path: state
       - name: Download candidate model
         uses: actions/download-artifact@v4
@@ -185,10 +210,10 @@ jobs:
         run: cargo build --release --locked
       - name: Re-ingest full corpus
         run: ./target/release/internet-token-engine --root . ingest --corpus fixtures/corpus
-      - name: Download reduced set
+      - name: Download globally pruned set
         uses: actions/download-artifact@v4
         with:
-          name: reduced
+          name: reduced-global
           path: state
       - name: Download candidate model
         uses: actions/download-artifact@v4
