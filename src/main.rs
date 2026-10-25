@@ -8,6 +8,7 @@
 //! on GPU runners is a Phase-1 milestone and is NOT in this binary.
 //! Nothing fetched from the network is ever executed.
 
+mod bpe;
 mod engine;
 mod fetch;
 mod json;
@@ -58,13 +59,18 @@ fn usage() -> String {
      Commands:\n\
      \x20 ingest    --corpus <dir> [--url-manifest <file>] [--cc-index <url>]\n\
      \x20             [--ddg-query <q>] [--shard <n>] [--num-shards <n>]\n\
+     \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
      \x20 prune     [--shard <n>] [--num-shards <n>] [--max-depth <n>] [--tau <f>]\n\
      \x20 reduce    [--max-depth <n>]\n\
      \x20 train     [--order <n>] [--steps <n>]  (steps 0 = unlimited)\n\
      \x20 evaluate  [--model <path>] [--probe-dir <dir>]\n\
      \x20 checkpoint\n\
      \x20 cycle     --corpus <dir> [--probe-dir <dir>] [--order <n>]\n\
-     \x20             [--max-depth <n>] [--steps <n>]\n"
+     \x20             [--max-depth <n>] [--steps <n>]\n\
+     \x20             [--tokenizer reference|bpe] [--bpe-merges <file>]\n\
+     \x20 tokenizer train-bpe --corpus <dir> [--merges <n>] [--out <file>]\n\
+     \x20 tokenizer encode --merges <file> --text <text>\n\
+     \x20 tokenizer decode --merges <file> --tokens <hex...>\n"
         .to_string()
 }
 
@@ -105,10 +111,42 @@ fn run() -> Result<(), String> {
                     ddg_query: args.get("ddg-query"),
                     shard,
                     num_shards: args.get_usize("num-shards", 4),
+                    tokenizer: args.get("tokenizer"),
+                    bpe_merges: args.get("bpe-merges"),
+                    config: config.clone(),
                 },
             )?;
             println!("ingest done: written={} duplicates={} errors={}", written, dups, errs);
             Ok(())
+        }
+        "tokenizer" => {
+            let sub = tokens.get(1).cloned().unwrap_or_default();
+            let sub_args = Args::parse(&tokens[2..]);
+            match sub.as_str() {
+                "train-bpe" => {
+                    let corpus = sub_args.get("corpus").ok_or("tokenizer train-bpe needs --corpus <dir>")?;
+                    engine::cmd_tokenizer_train(
+                        &root,
+                        &corpus,
+                        sub_args.get_usize("merges", 200),
+                        sub_args.get("out"),
+                    )?;
+                    Ok(())
+                }
+                "encode" => {
+                    let merges = sub_args.get("merges").ok_or("tokenizer encode needs --merges <file>")?;
+                    let text = sub_args.get("text").ok_or("tokenizer encode needs --text <text>")?;
+                    engine::cmd_tokenizer_encode(&merges, &text)?;
+                    Ok(())
+                }
+                "decode" => {
+                    let merges = sub_args.get("merges").ok_or("tokenizer decode needs --merges <file>")?;
+                    let tokens = sub_args.get("tokens").ok_or("tokenizer decode needs --tokens <hex...>")?;
+                    engine::cmd_tokenizer_decode(&merges, &tokens)?;
+                    Ok(())
+                }
+                _ => Err(format!("unknown tokenizer subcommand '{}'\n{}", sub, usage())),
+            }
         }
         "prune" => {
             let shard_raw = args.get_usize("shard", usize::MAX);
@@ -162,6 +200,8 @@ fn run() -> Result<(), String> {
                     order: args.get_usize("order", 0),
                     max_depth: args.get_usize("max-depth", 8),
                     steps: args.get_usize("steps", 0),
+                    tokenizer: args.get("tokenizer"),
+                    bpe_merges: args.get("bpe-merges"),
                 },
             )?;
             Ok(())

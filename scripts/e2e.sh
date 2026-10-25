@@ -58,3 +58,29 @@ print(f"  manifest_sha256={cur['manifest_sha256']}")
 EOF
 echo "--- v1 manifest ---"
 cat "$MANIFEST"
+
+echo "=== BPE path (Phase 2) ==="
+WORK2="$(mktemp -d /tmp/rwt-e2e-bpe-XXXXXX)"
+"$BIN" --root "$WORK2" tokenizer train-bpe --corpus "$ROOT/fixtures/corpus" --merges 200
+"$BIN" --root "$WORK2" cycle --corpus "$ROOT/fixtures/corpus" --probe-dir "$ROOT/fixtures/probe" --steps 0 --tokenizer bpe
+python3 - "$WORK2" <<'EOF'
+import json, sys
+work = sys.argv[1]
+man = json.load(open(f"{work}/checkpoints/v1/manifest.json"))
+assert man["status"] == "promoted" and man["version"] == "v1", man
+reg = json.load(open(f"{work}/state/registry.json"))
+assert reg["tokenizer"] == "bpe", reg.get("tokenizer")
+vocab = json.load(open(f"{work}/data/vocab.json"))["tokens"]
+assert len(vocab) == 456, f"expected BPE vocab 456, got {len(vocab)}"
+# Every retained doc's hex tokens must decode back to its stored text.
+import glob, os
+checked = 0
+for path in glob.glob(f"{work}/data/shards/*.json"):
+    doc = json.load(open(path))
+    raw = b"".join(bytes.fromhex(t) for t in doc["tokens"])
+    assert raw.decode("utf-8") == doc["text"], f"round-trip failed for {doc['sha256']}"
+    checked += 1
+assert checked > 0, "no shards checked"
+print(f"BPE verify OK: {checked} docs round-trip, vocab 456, v1 promoted")
+EOF
+rm -rf "$WORK2"

@@ -3,9 +3,9 @@
 //! This is NOT BPE. Tokens are lowercased alphanumeric runs plus one
 //! token per non-alphanumeric, non-whitespace character. The mapping
 //! is fixed, deterministic, and independent of training order, so the
-//! same document always tokenizes the same way. BPE training is a
-//! later milestone, not claimed anywhere in this repo.
-//!
+//! same document always tokenizes the same way. BPE lives in
+//! bpe.rs and is selected with --tokenizer bpe (see
+//! docs/tokenizer.md); this module is the fallback path.
 //! The vocabulary is built by scanning documents in ascending SHA-256
 //! order and assigning ids in first-seen order, then persisted as
 //! `data/vocab.json` so later runs reuse identical ids.

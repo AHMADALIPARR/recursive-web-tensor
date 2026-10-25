@@ -59,3 +59,68 @@ fn cycle_produces_promoted_v1() {
     assert!(work.join("checkpoints/v1/model.json").exists(), "no v1 model");
     let _ = fs::remove_dir_all(&work);
 }
+
+#[test]
+fn cycle_bpe_promotes() {
+    let work = std::env::temp_dir().join(format!("rwt-e2e-bpe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).unwrap();
+    let corpus = work.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    let docs = [
+        ("a.txt", "The river flows through the valley while morning mist hangs over the water and birds sing."),
+        ("b.txt", "Mountains rise beyond the trees and snow covers the highest peaks through the winter months."),
+        ("c.txt", "To cook rice well, rinse the grains until the water runs clear, then soak them before cooking."),
+        ("d.txt", "Astronomers study the light from distant stars to learn what they are made of and how far away."),
+    ];
+    for (name, text) in docs {
+        fs::write(corpus.join(name), text).unwrap();
+    }
+    let probe = work.join("probe");
+    fs::create_dir_all(&probe).unwrap();
+    fs::write(probe.join("p.txt"), "Streams gather rainfall from hillsides and carry it downhill into rivers.").unwrap();
+
+    // Train BPE, then run the full cycle on the BPE path.
+    let out = Command::new(bin())
+        .arg("--root")
+        .arg(&work)
+        .arg("tokenizer")
+        .arg("train-bpe")
+        .arg("--corpus")
+        .arg(&corpus)
+        .arg("--merges")
+        .arg("64")
+        .output()
+        .expect("train-bpe");
+    assert!(out.status.success(), "train-bpe failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(work.join("state/bpe.json").exists(), "no bpe.json");
+
+    let out = Command::new(bin())
+        .arg("--root")
+        .arg(&work)
+        .arg("cycle")
+        .arg("--corpus")
+        .arg(&corpus)
+        .arg("--probe-dir")
+        .arg(&probe)
+        .arg("--steps")
+        .arg("0")
+        .arg("--tokenizer")
+        .arg("bpe")
+        .output()
+        .expect("run bpe cycle");
+    assert!(
+        out.status.success(),
+        "bpe cycle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = fs::read_to_string(work.join("checkpoints/v1/manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\":\"promoted\""), "manifest: {}", manifest);
+    // Registry must record the BPE tokenizer, and shards must hold
+    // hex tokens that decode back to the stored text.
+    let registry = fs::read_to_string(work.join("state/registry.json")).unwrap();
+    assert!(registry.contains("\"tokenizer\":\"bpe\""), "registry: {}", registry);
+    assert!(work.join("checkpoints/v1/model.json").exists(), "no v1 model");
+    let _ = fs::remove_dir_all(&work);
+}

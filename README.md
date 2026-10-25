@@ -31,9 +31,13 @@ today.
   crates**, so `cargo build --release --locked` works offline) that
   runs the full cycle end to end on a small corpus: ingest, prune,
   train, evaluate, checkpoint — all real, all tested.
-- A **reference tokenizer**: deterministic word/byte-level tokens.
-  This is **NOT BPE**. BPE training is a later milestone, not
-  claimed.
+- A **BPE tokenizer** (Phase 2, real): byte-level base vocab,
+  frequency-ranked merge learning from a corpus, merges + vocab
+  persisted in `state/bpe.json`, rank-order encoding, exact
+  decode round-trip. Selected with `--tokenizer bpe` (or
+  `tokenizer: "bpe"` in config); the deterministic word/byte-level
+  **reference tokenizer** remains the default and the fallback.
+  See `docs/tokenizer.md`.
 - A **reference trainer**: an incremental n-gram language model
   (default order 3) merged into the prior checkpoint (adapter-style
   update, count-space replay). This is **statistical, not neural**.
@@ -49,7 +53,7 @@ today.
 ## What does NOT exist yet
 
 - Internet-scale ingestion (see Phase 1 below).
-- BPE tokenization, neural training, WARC record fetching.
+- Neural training, WARC record fetching.
 - A registered self-hosted GPU runner (owner's hardware step).
 - 100 million tokens processed. That number is a **target**, and the
   section below says exactly what exists toward it.
@@ -102,7 +106,7 @@ See `docs/architecture.md` for the full job/artifact flow.
 
 ```
 data/shards/<sha256>.json   content-addressed documents
-data/vocab.json             reference-tokenizer vocabulary
+data/vocab.json             tokenizer vocabulary (trained BPE vocab in BPE mode)
 state/registry.json         ingest index (or registry-shard-N)
 state/prune.json            latest prune dispositions
 state/shards/shard-N.json   per-shard prune outputs (CI jobs)
@@ -254,7 +258,7 @@ Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
 ## Layout
 
 ```
-cli (Rust, std-only): src/{main,engine,tokenizer,scoring,sha256,json,fetch}.rs
+cli (Rust, std-only): src/{main,engine,tokenizer,bpe,scoring,sha256,json,fetch}.rs
 .github/workflows/rwt-cycle.yml   Actions control plane
 docs/                              architecture, scoring, runners
 sources/                           discovery families + license policy

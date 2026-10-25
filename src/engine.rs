@@ -16,6 +16,7 @@
 //! Only the publish chain writes checkpoints. Shard jobs write only
 //! their own shard outputs; the reduce step merges them.
 
+use crate::bpe::Bpe;
 use crate::fetch;
 use crate::json::{self, Value};
 use crate::scoring::{self, Weights};
@@ -49,6 +50,8 @@ pub struct Config {
     pub ngram_order: usize,
     pub near_dup_threshold: f64,
     pub shingle_n: usize,
+    pub tokenizer: String,
+    pub bpe_merges: String,
 }
 
 impl Default for Config {
@@ -76,6 +79,8 @@ impl Default for Config {
             ngram_order: 3,
             near_dup_threshold: 0.9,
             shingle_n: 5,
+            tokenizer: "reference".to_string(),
+            bpe_merges: "state/bpe.json".to_string(),
         }
     }
 }
@@ -122,6 +127,16 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         ngram_order: get_usize(&v, "ngram_order", d.ngram_order).max(1),
         near_dup_threshold: get_f64(&v, "near_dup_threshold", d.near_dup_threshold),
         shingle_n: get_usize(&v, "shingle_n", d.shingle_n).max(1),
+        tokenizer: v
+            .get("tokenizer")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&d.tokenizer)
+            .to_string(),
+        bpe_merges: v
+            .get("bpe_merges")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&d.bpe_merges)
+            .to_string(),
     })
 }
 
@@ -226,9 +241,67 @@ pub fn load_docs(root: &Path) -> Result<Vec<Doc>, String> {
     Ok(docs)
 }
 
-fn make_doc(source: &str, category: &str, license: &str, text: &str) -> Doc {
+/// Tokenizer mode for ingest. Reference tokenizes to plain word
+/// strings; BPE tokenizes to hex strings of the learned symbols
+/// (unambiguous for every downstream string-based stage).
+pub enum TokMode {
+    Reference,
+    Bpe(Bpe),
+}
+
+impl TokMode {
+    pub fn tokenize(&self, text: &str) -> Vec<String> {
+        match self {
+            TokMode::Reference => tokenizer::tokenize(text),
+            TokMode::Bpe(b) => b.encode_hex(text),
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            TokMode::Reference => "reference",
+            TokMode::Bpe(_) => "bpe",
+        }
+    }
+    /// BPE vocabulary in id order, if this mode is BPE.
+    pub fn vocab_hex(&self) -> Option<Vec<String>> {
+        match self {
+            TokMode::Bpe(b) => Some(b.vocab_hex()),
+            TokMode::Reference => None,
+        }
+    }
+}
+
+/// Resolve the effective tokenizer: CLI flag wins, then config.
+/// BPE fails closed when the merges file is missing — silently
+/// falling back to the reference tokenizer would corrupt token-id
+/// comparability across epochs.
+pub fn resolve_tok_mode(
+    root: &Path,
+    config: &Config,
+    flag: Option<String>,
+    merges_flag: Option<String>,
+) -> Result<TokMode, String> {
+    let name = flag.unwrap_or_else(|| config.tokenizer.clone());
+    match name.as_str() {
+        "reference" => Ok(TokMode::Reference),
+        "bpe" => {
+            let path = match merges_flag {
+                Some(p) => PathBuf::from(p),
+                None => root.join(&config.bpe_merges),
+            };
+            let bpe = Bpe::load_file(&path)?;
+            Ok(TokMode::Bpe(bpe))
+        }
+        other => Err(format!(
+            "unknown tokenizer '{}' (want 'reference' or 'bpe')",
+            other
+        )),
+    }
+}
+
+fn make_doc(source: &str, category: &str, license: &str, text: &str, mode: &TokMode) -> Doc {
     let sha = sha256::hex(text.as_bytes());
-    let tokens = tokenizer::tokenize(text);
+    let tokens = mode.tokenize(text);
     Doc {
         sha,
         source: source.to_string(),
@@ -249,12 +322,16 @@ pub struct IngestArgs {
     pub ddg_query: Option<String>,
     pub shard: Option<usize>,
     pub num_shards: usize,
+    pub tokenizer: Option<String>,
+    pub bpe_merges: Option<String>,
+    pub config: Config,
 }
 
 /// Ingest documents from a local corpus directory, a URL manifest,
 /// and optionally one Common Crawl index lookup and one DuckDuckGo
 /// discovery query. Returns (ingested_new, duplicates, errors).
 pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), String> {
+    let mode = resolve_tok_mode(root, &a.config, a.tokenizer.clone(), a.bpe_merges.clone())?;
     let mut docs: Vec<Doc> = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
 
@@ -278,7 +355,7 @@ pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), 
                 let text = std::fs::read_to_string(&p)
                     .map_err(|e| format!("cannot read {}: {}", p.display(), e))?;
                 let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                docs.push(make_doc(&format!("local:{}", name), "local-corpus", "public-domain", &text));
+                docs.push(make_doc(&format!("local:{}", name), "local-corpus", "public-domain", &text, &mode));
             }
         }
     }
@@ -303,7 +380,7 @@ pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), 
             match fetch::curl_get(&url, 30, 2_000_000) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
-                    docs.push(make_doc(&source, &category, &license, &text));
+                    docs.push(make_doc(&source, &category, &license, &text, &mode));
                 }
                 Err(e) => {
                     let mut err = Value::obj();
@@ -367,9 +444,16 @@ pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), 
     let mut ordered: Vec<Doc> = seen.into_values().collect();
     ordered.sort_by(|a, b| a.sha.cmp(&b.sha));
 
-    // Vocabulary in first-seen order over SHA-sorted docs.
-    let token_lists: Vec<Vec<String>> = ordered.iter().map(|d| d.tokens.clone()).collect();
-    let vocab = tokenizer::build_vocab(&token_lists);
+    // Vocabulary: in BPE mode the trained vocab in id order; in
+    // reference mode, first-seen order over SHA-sorted docs.
+    let vocab: Vec<String> = match mode.vocab_hex() {
+        Some(v) => v,
+        None => {
+            let token_lists: Vec<Vec<String>> =
+                ordered.iter().map(|d| d.tokens.clone()).collect();
+            tokenizer::build_vocab(&token_lists)
+        }
+    };
     let mut vocab_json = Value::obj();
     vocab_json.put("tokens", Value::Arr(vocab.iter().map(|t| Value::s(t)).collect()));
     write_json(&root.join("data/vocab.json"), &vocab_json)?;
@@ -397,6 +481,7 @@ pub fn cmd_ingest(root: &Path, a: &IngestArgs) -> Result<(usize, usize, usize), 
         written += 1;
     }
     let mut registry = Value::obj();
+    registry.put("tokenizer", Value::s(mode.name()));
     registry.put("documents", Value::Arr(registry_docs));
     registry.put("duplicates", Value::n(duplicates as i64));
     registry.put("total_unique", Value::n(ordered.len() as i64));
@@ -1284,6 +1369,8 @@ pub struct CycleArgs {
     pub order: usize,
     pub max_depth: usize,
     pub steps: usize,
+    pub tokenizer: Option<String>,
+    pub bpe_merges: Option<String>,
 }
 
 /// Run the full bounded cycle locally: ingest -> prune -> reduce ->
@@ -1300,6 +1387,9 @@ pub fn cmd_cycle(root: &Path, config: &Config, a: &CycleArgs) -> Result<Value, S
             ddg_query: None,
             shard: None,
             num_shards: 4,
+            tokenizer: a.tokenizer.clone(),
+            bpe_merges: a.bpe_merges.clone(),
+            config: config.clone(),
         },
     )?;
     let prune_out = cmd_prune(
@@ -1320,6 +1410,67 @@ pub fn cmd_cycle(root: &Path, config: &Config, a: &CycleArgs) -> Result<Value, S
     summary.put("checkpoint", manifest);
     println!("cycle: epoch complete");
     Ok(summary)
+}
+
+// ---------------------------------------------------------------- tokenizer
+
+/// Train BPE merges from a corpus directory of .txt files and write
+/// the merges+vocab file (default <root>/state/bpe.json).
+pub fn cmd_tokenizer_train(
+    root: &Path,
+    corpus: &str,
+    num_merges: usize,
+    out: Option<String>,
+) -> Result<Bpe, String> {
+    let dir = Path::new(corpus);
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("cannot list corpus {}: {}", corpus, e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let p = entry.path();
+        if p.extension().map(|e| e == "txt").unwrap_or(false) {
+            files.push(p);
+        }
+    }
+    files.sort();
+    let mut texts: Vec<String> = Vec::new();
+    for p in &files {
+        texts.push(
+            std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {}", p.display(), e))?,
+        );
+    }
+    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let bpe = Bpe::train(&refs, num_merges);
+    let out_path = match out {
+        Some(p) => PathBuf::from(p),
+        None => root.join("state/bpe.json"),
+    };
+    write_json(&out_path, &bpe.to_json())?;
+    println!(
+        "tokenizer train-bpe: {} docs, {} merges, vocab {} -> {}",
+        texts.len(),
+        bpe.merges.len(),
+        bpe.vocab.len(),
+        out_path.display()
+    );
+    Ok(bpe)
+}
+
+/// Encode one text with a trained merges file; prints hex tokens.
+pub fn cmd_tokenizer_encode(merges_path: &str, text: &str) -> Result<Vec<String>, String> {
+    let bpe = Bpe::load_file(Path::new(merges_path))?;
+    let tokens = bpe.encode_hex(text);
+    println!("{} tokens: {}", tokens.len(), tokens.join(" "));
+    Ok(tokens)
+}
+
+/// Decode space-separated hex tokens with a trained merges file;
+/// prints the reconstructed text.
+pub fn cmd_tokenizer_decode(merges_path: &str, tokens: &str) -> Result<String, String> {
+    let bpe = Bpe::load_file(Path::new(merges_path))?;
+    let toks: Vec<String> = tokens.split_whitespace().map(|s| s.to_string()).collect();
+    let text = bpe.decode_hex(&toks);
+    println!("{}", text);
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -1377,7 +1528,7 @@ mod tests {
         );
         cmd_ingest(
             &root,
-            &IngestArgs { corpus: Some(root.join("corpus").to_string_lossy().into_owned()), url_manifest: None, cc_index: None, ddg_query: None, shard: None, num_shards: 4 },
+            &IngestArgs { corpus: Some(root.join("corpus").to_string_lossy().into_owned()), url_manifest: None, cc_index: None, ddg_query: None, shard: None, num_shards: 4, tokenizer: None, bpe_merges: None, config: Config::default() },
         )
         .unwrap();
         // Force licenses: rewrite shard files for c (unknown) and add a denied doc.
@@ -1390,7 +1541,7 @@ mod tests {
             }
         }
         let denied_text = "A completely different document about cooking rice and beans with garlic and oil.";
-        let mut denied = make_doc("local:denied.txt", "local-corpus", "proprietary", denied_text);
+        let mut denied = make_doc("local:denied.txt", "local-corpus", "proprietary", denied_text, &TokMode::Reference);
         denied.tokens = tokenizer::tokenize(denied_text);
         write_json(&root.join("data/shards").join(format!("{}.json", denied.sha)), &doc_to_json(&denied)).unwrap();
 
@@ -1447,6 +1598,8 @@ mod tests {
                 order: 0,
                 max_depth: 8,
                 steps: 0,
+                tokenizer: None,
+                bpe_merges: None,
             },
         )
         .unwrap();
