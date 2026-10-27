@@ -1,239 +1,67 @@
-# RECURSIVE WEB TENSOR (RWT)
+# Recursive Web Tensor
 
-GitHub Actions as the **distributed control plane** for a recursively
-pruned internet-token learning system — not one giant GPU job.
+[![Recursive Token Engine](https://github.com/AHMADALIPARR/recursive-web-tensor/actions/workflows/rwt-cycle.yml/badge.svg)](https://github.com/AHMADALIPARR/recursive-web-tensor/actions/workflows/rwt-cycle.yml)
+![License](https://img.shields.io/badge/license-AGPL--3.0%20%2B%20SnapKitty%20Opaque-blue)
+![Rust](https://img.shields.io/badge/Rust-95%25-orange?logo=rust)
+![Shell](https://img.shields.io/badge/Shell-5%25-89e051?logo=gnubash&logoColor=white)
+![Dependencies](https://img.shields.io/badge/crates-zero%20dependencies-success)
+![Last commit](https://img.shields.io/github/last-commit/AHMADALIPARR/recursive-web-tensor)
 
-Every workflow execution performs one bounded cycle over persistent
-state, then stops:
+**GitHub Actions as the control plane for a learning system that keeps pruning its own training data.**
 
-```
-Discover -> Tokenize -> Score -> Prune -> Train -> Evaluate
-    -> Commit checkpoint -> Repeat (next scheduled run)
-```
+![Architecture](docs/img/architecture.png)
 
-Recursion happens **across epochs** (repeated runs over persistent
-state), never inside an infinitely running job.
+## What it is
 
-## The design decision
+Most training setups run one giant job. This one doesn't.
 
-GitHub Actions **plus** the owner's own GPUs. GitHub-hosted runners
-do crawling, parsing, tokenization, pruning, and testing. Actual GPU
-training runs on a Jetson Orin NX or RTX 3080 box through a secured
-self-hosted runner (see `docs/runners.md`). Schedule runs are
-CPU-only; the GPU job runs only on manual dispatch with the GPU input
-enabled. Without a registered self-hosted GPU runner, the GPU job
-stays queued — GPU training is a slot, not a claim that it works
-today.
+Each Actions run does one small round of work and stops. It takes in documents, scores them, throws out the weak and duplicate ones, trains a small model on what is left, and checks the result. If the result is good, it saves a checkpoint. Then the next scheduled run picks up from there.
 
-## What exists now (honest scope)
+The loop happens across runs, not inside one. Nothing runs forever.
 
-- A **reference CLI** (`internet-token-engine`, Rust, **zero external
-  crates**, so `cargo build --release --locked` works offline) that
-  runs the full cycle end to end on a small corpus: ingest, prune,
-  train, evaluate, checkpoint — all real, all tested.
-- A **BPE tokenizer** (Phase 2, real): byte-level base vocab,
-  frequency-ranked merge learning from a corpus, merges + vocab
-  persisted in `state/bpe.json`, rank-order encoding, exact
-  decode round-trip. Selected with `--tokenizer bpe` (or
-  `tokenizer: "bpe"` in config); the deterministic word/byte-level
-  **reference tokenizer** remains the default and the fallback.
-  See `docs/tokenizer.md`.
-- A **neural trainer** (Phase 3, real, the default): a small
-  feedforward NNLM (embedding 16 + tanh MLP 32 over a 4-token
-  context, softmax output) trained from scratch with
-  hand-implemented backprop + Adam, plus init-from-prior-checkpoint
-  and replay through the same checkpoint/gating interface. This is
-  **not** a fine-tune of a named pretrained model — no pretrained
-  weights exist here. The incremental n-gram trainer (order 3,
-  count-space replay) stays available via `--trainer ngram`, and
-  at fixture scale it generalizes better than the neural trainer
-  (held-out 4.98 vs neural 9.28 on 8 docs — overfitting, documented
-  in `docs/neural.md`, not hidden). See `docs/neural.md`.
-- A **validation gate**: a checkpoint is promoted only if held-out
-  loss does not regress beyond tolerance; otherwise the prior
-  checkpoint stands and the epoch is recorded as rejected.
+## How a round works
 
-## What does NOT exist yet
+1. **Ingest.** Documents are read in, hashed with SHA-256 and split into four shards by the first byte of the hash.
+2. **Score.** Every document gets a score from quality, novelty, information density and redundancy.
+3. **Prune.** A document is kept if its score clears a threshold. The best documents in each category are always kept. Near-copies are folded into one. Unknown or banned licenses never reach training.
+4. **Train.** A small neural net learns from the kept documents. It is written from scratch in Rust, with its own backprop and Adam.
+5. **Evaluate.** The model is tested on held-out documents and on a few probe texts.
+6. **Gate.** The new checkpoint is only promoted if its held-out loss is no worse than the last one plus 0.10. If not, the old checkpoint stays.
 
-- Internet-scale ingestion (see Phase 1 below).
-- GPU training (the GPU runner slot runs the CPU trainer today).
-- A registered self-hosted GPU runner (owner's hardware step).
-- 100 million tokens processed. That number is a **target**, and the
-  section below says exactly what exists toward it.
+The threshold is not fixed. It starts at 0.30. It goes up by 0.02 when the last round improved the loss and down by 0.02 when it got worse. It stays between 0.15 and 0.50. So the data never gets pruned down to nothing.
 
-## Architecture
+The score is `S = 0.3*Q + 0.3*N + 0.2*I - 0.2*R`. The details are in [docs/scoring.md](docs/scoring.md).
 
-```
- GitHub Actions (control plane)
-   schedule "17 */6 * * *" + manual dispatch
-   process [matrix shards 0..3]  (ubuntu-latest, 45 min each)
-        |  ingest --shard N, prune --shard N, upload shard manifest
-   reduce                          (merge retained sets, Merkle root)
-        |
-   train  (CPU; re-ingests deterministically, merges n-gram counts)
-        |
-   train-gpu [self-hosted, gpu]   (manual dispatch + gpu input only;
-        |  same CLI train command; artifact only, never checkpoints)
-   evaluate (held-out loss + probe; writes evaluation, not checkpoints)
-        |
-   publish (contents:write; checkpoint gate, upload artifact,
-        commit state to the rwt-state branch)
+## Latest checkpoint
 
- Persistent state (rwt-state branch, never main):
-   state/current.json, state/validation.json,
-   state/reduced.json, state/evaluation.json,
-   checkpoints/<version>/manifest.json (+ model.json if promoted)
-```
+The state lives on the `rwt-state` branch, not on `main`.
 
-Rules that keep this sound:
+**v1, promoted on Oct 27, 2026 at 5:05 AM Pacific.** It is the first checkpoint, so it has no parent.
 
-- **Shard jobs never write the model.** Only the publish job
-  writes checkpoints, after the gate.
-- **Deterministic re-ingest.** Train/evaluate/publish jobs
-  re-ingest the corpus instead of shipping shard blobs between
-  jobs. Ingest is deterministic (SHA-sorted, content-addressed),
-  so the re-ingested corpus matches the sharded one.
-- **Shard-local pruning was an approximation; global pruning closes
-  it.** Each shard prunes only its own docs, so a near-duplicate
-  pair split across shards could both survive (exact duplicates
-  never could: same SHA = same shard). The `prune-global` step
-  (MinHash/LSH candidates, exact-Jaccard verification) now runs
-  after `reduce` and before `train`, in the cycle and in the
-  workflow. See `docs/global-pruning.md`.
-- **Size discipline.** The `rwt-state` branch holds manifests,
-  metrics, and small state only. Never commit large model files to
-  main or to the state branch; model files travel as artifacts
-  (checkpoints 90 days, shard outputs 7 days, reduced set and
-  candidate models 30 days).
+| | |
+|---|---|
+| Documents kept | 8 of 8 |
+| Tokens kept | 605 (455 for training, 150 held out) |
+| Held-out loss | 9.28 |
+| Probe loss | 7.07 |
+| Perplexity | 10,724 |
+| Model | 18,642 weights, 338 tokens in the vocab |
+| Model file | 373 KB |
+| Merkle root | `8c684e44...a251d` |
 
-See `docs/architecture.md` for the full job/artifact flow.
+The next run, at 5:17 AM Pacific, scored a held-out loss of 11.74. That is over the 9.38 limit, so the gate rejected it. Its manifest is saved as v2 and v1 is still the current checkpoint.
 
-## The cycle and the state model
+![Tokens kept per document](docs/img/tokens-per-doc.png)
 
-```
-data/shards/<sha256>.json   content-addressed documents
-data/vocab.json             tokenizer vocabulary (trained BPE vocab in BPE mode)
-state/registry.json         ingest index (or registry-shard-N)
-state/prune.json            latest prune dispositions
-state/shards/shard-N.json   per-shard prune outputs (CI jobs)
-state/reduced.json          merged retained set + Merkle root
-state/model-next.json       candidate model (train output)
-state/evaluation.json       gate metrics (evaluate output)
-state/current.json          promoted checkpoint pointer
-state/validation.json       loss trend driving adaptive tau
-checkpoints/<version>/      manifest.json (+ model.json if promoted)
-```
+![Loss per checkpoint](docs/img/checkpoint-loss.png)
 
-Shard assignment is deterministic: `shard = first_sha_byte mod
-num_shards`, so shards are stable across runs.
+![Prune scores](docs/img/prune-scores.png)
 
-## Scoring
+Each of these charts comes from the real files on `rwt-state`. The scores come from running the engine on the fixture corpus. [docs/tools/make_figures.py](docs/tools/make_figures.py) rebuilds all of them.
 
-```
-S(d) = a*Q(d) + b*N(d) + g*I(d) - d*R(d)
-```
+## Run it
 
-Defaults: `a=0.3, b=0.3, g=0.2, d=0.2` (configurable in
-`config.json`; see `config.example.json`).
-
-- **Q** — quality from text properties: length band, printable
-  ratio, alphabetic ratio, repeated-line penalty.
-- **N** — novelty: `1 - max` word-shingle Jaccard against the other
-  candidate documents.
-- **I** — information density: unique-token ratio + normalized
-  Shannon entropy of the token distribution.
-- **R** — redundancy: that same max Jaccard.
-- Exact SHA-256 duplicates are deduped at ingest, before scoring.
-
-Full definitions and a worked example: `docs/scoring.md`.
-
-## Pruning: adaptive thresholds, never fixed percentages
-
-Repeated fixed 50% pruning would leave ~0.1% of the corpus after ten
-iterations and destroy coverage. So the threshold `tau` adapts to
-measured validation performance:
-
-- Base `tau0 = 0.30` (configurable).
-- Validation improved since the last promotion: `tau += 0.02`
-  (tighten). Degraded: `tau -= 0.02` (loosen). Clamped to
-  `[0.15, 0.50]`.
-- Top-`k` documents per category (`k = 2` by default) are always
-  kept as representative samples, even below `tau`.
-
-Dispositions: **Keep** (`S >= tau` or top-k), **Compress**
-(near-duplicate: keep the lowest-SHA canonical only, record the
-alias), **Quarantine** (unknown license or invalid content — never
-trained on), **Reject** (explicitly denied license, or below `tau`
-and not top-k). Compress alias chains resolve in `reduce`, capped
-by `--max-depth` (default 8).
-
-License policy (`sources/license-policy.md`): an allowlist
-(public-domain, CC0, CC-BY, CC-BY-SA, MIT, Apache-2.0, BSD) and a
-denylist (proprietary, all-rights-reserved, no-license). Unknown
-licenses quarantine; denied licenses reject. License detection uses
-source metadata and manifests — it is not legal advice.
-
-## Checkpoints and the gate
-
-`checkpoints/<version>/manifest.json` carries version, parent
-version, the SHA-256 of the parent manifest (hash chain), the
-Merkle root over retained shard hashes, metrics, and timestamp.
-Promotion requires `new_heldout_loss <= prev_heldout_loss +
-gate_tolerance` (default `0.10` nats). On rejection the manifest is
-still written (status `rejected`), `current.json` is untouched, and
-the prior checkpoint stands. A corrupted chain pointer (stored
-parent hash not matching the parent manifest file) refuses to
-promote at all.
-
-## Safeguards (non-negotiable)
-
-- **Fetched content is untrusted data, never executed.** The CLI
-  fetches with `curl` (HTTP GET only, timeout, byte cap) and treats
-  every byte as text to tokenize. No fetched script, instruction,
-  or embedded command is ever run, interpreted, or passed to a
-  shell.
-- **Source permissions and training licenses are enforced at ingest
-  and again at prune** (allowlist/denylist above). A document that
-  fails either gate never reaches training.
-- **No secrets in this repo.** Workflows use `GITHUB_TOKEN` only.
-  Runner registration tokens are entered on the hardware, never
-  committed (see `docs/runners.md`).
-- **No license file in this repo.** The license is TBD by the
-  owner; the CLI's own `Cargo.toml` carries a placeholder
-  `LicenseRef-Owner-TBD` and nothing here grants rights.
-
-## Scaling limits (stated, not hidden)
-
-- GitHub documents a **6-hour limit per GitHub-hosted job** and a
-  **256-job matrix maximum**. This workflow uses 45-minute shard
-  jobs and a 4-job matrix — far inside both.
-- Standard public-repository Actions usage is generally free
-  within the applicable rules, but that is **not an unlimited
-  training-compute entitlement**. The bounded-cycle design exists
-  because of this limit, not in spite of it.
-- The reference trainer is O(corpus) per epoch with O(n^2)
-  shingle comparisons inside shard-local prune. That is fine at
-  reference scale and a known wall at internet scale; the global
-  step already uses shingle indexing (MinHash/LSH) instead of
-  O(n^2) comparison — see `docs/global-pruning.md` — but
-  shard-local prune itself is still O(n^2) per shard, and that
-  remains the wall to watch.
-
-## Phase 1 target: 100 MILLION TOKENS
-
-**Target, not a claim.** What exists toward it today: a small-corpus
-end-to-end reference run (8 fixture documents, 605 tokens retained,
-real checkpoint — see below). What the milestone requires:
-
-1. Ingest permitted public documents with provenance recorded.
-2. Produce deterministic, content-addressed token shards.
-3. Prune duplicates and low-quality content recursively.
-4. Fine-tune a small existing model on the retained samples (the
-   neural trainer that plugs into the `train-gpu` slot).
-5. Measure held-out loss, retrieval quality, and knowledge
-   retention against a baseline.
-
-## Run it locally
+You need Rust. The engine has no outside crates, so it builds offline.
 
 ```sh
 cargo build --release --locked
@@ -241,36 +69,69 @@ cargo build --release --locked
   cycle --corpus fixtures/corpus --probe-dir fixtures/probe --steps 0
 ```
 
-The fixture run produces a real `checkpoints/v1/manifest.json`
-with a verifiable Merkle root. Verify it independently:
+That runs a full round on the eight fixture documents and writes `checkpoints/v1/`.
+
+Check it end to end, with an independent hash check in Python:
 
 ```sh
-sh scripts/e2e.sh            # runs the cycle + Python-hashlib checks
+sh scripts/e2e.sh
 cargo test --release --locked
 ```
 
-Subcommands: `ingest`, `prune`, `train`, `evaluate`, `reduce`,
-`checkpoint`, `cycle`. Run any of them with no arguments for usage.
-`--root` may appear before the command or among its flags.
+Commands: `ingest`, `prune`, `reduce`, `prune-global`, `train`, `evaluate`, `checkpoint`, `cycle`, `tokenizer`. Run the binary with no arguments to see the flags.
 
-## Sources
+## The scheduled workflow
 
-- `sources/duckduckgo.md` — discovery via the html-lite endpoint.
-- `sources/common-crawl.md` — index lookup and WARC record fetching
-  (both implemented; see `docs/warc.md`).
-- `sources/github-corpus.md` — GitHub corpus via URL manifests and
-  local clones (code search API needs auth; not faked).
-- `sources/license-policy.md` — allowlist/denylist and enforcement
-  points.
+The workflow is [.github/workflows/rwt-cycle.yml](.github/workflows/rwt-cycle.yml). It runs at minute 17 of every sixth hour. You can also start it by hand:
 
-## Layout
+```sh
+gh workflow run rwt-cycle.yml
+```
+
+The jobs run in this order:
+
+- `process` runs four shards at the same time. Each one ingests and prunes its own documents.
+- `reduce` merges the shards and builds the Merkle root.
+- `prune-global` finds near-duplicates that landed in different shards, using MinHash and LSH.
+- `train` trains the model and uploads it as an artifact.
+- `evaluate` measures loss on held-out and probe texts.
+- `publish` runs the gate, writes the checkpoint and pushes `state/` and `checkpoints/` to `rwt-state`.
+
+Only `publish` can write a checkpoint. It is the only job with write access.
+
+There is also a `train-gpu` job for a self-hosted GPU runner. It only runs on a manual start with the `gpu` input on. It runs the same trainer today and only uploads an artifact. See [docs/runners.md](docs/runners.md).
+
+## Where the data comes from
+
+- Local text files, which is what the fixtures use.
+- Common Crawl WARC records ([docs/warc.md](docs/warc.md)).
+- URL manifests and DuckDuckGo discovery ([sources/](sources/)).
+
+Licenses are checked at ingest and again at prune. Public domain, CC0, CC-BY, CC-BY-SA, MIT, Apache-2.0 and BSD are allowed. Proprietary and all-rights-reserved are rejected. Unknown ones are quarantined. Fetched text is only ever tokenized. It is never run.
+
+## Repo layout
 
 ```
-cli (Rust, std-only): src/{main,engine,tokenizer,bpe,neural,minhash,scoring,sha256,json,fetch,warc}.rs
-.github/workflows/rwt-cycle.yml   Actions control plane
-docs/                              architecture, scoring, runners
-sources/                           discovery families + license policy
-fixtures/corpus, fixtures/probe    reference corpora (tiny, real)
-config.example.json                every tunable, with defaults
-scripts/e2e.sh                     cycle + independent verification
+src/                  the engine (Rust): tokenizer, BPE, scoring, minhash, neural trainer, WARC
+.github/workflows/    rwt-cycle.yml, the scheduled workflow
+docs/                 architecture, scoring, pruning, tokenizer, neural, runners, WARC
+docs/img/             the pictures in this README
+docs/tools/           make_figures.py, which draws them
+sources/              where documents come from, and the license policy
+fixtures/             the small corpus, probe texts and sample WARC files
+scripts/e2e.sh        full round plus independent checks
+tests/                end-to-end tests
+config.example.json   every setting with its default
 ```
+
+## Where it stands
+
+The corpus is eight small documents. The goal is 100 million tokens, and that is still ahead. The round, the gate and the state branch all work today.
+
+## License
+
+Dual licensed under AGPL-3.0 and the SnapKitty Opaque License.
+
+## Author
+
+Ahmad Ali Parr
