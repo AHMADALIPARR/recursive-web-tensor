@@ -246,6 +246,6 @@ jobs:
           rm -rf state checkpoints
           cp -r /tmp/rwt-state-out state
           cp -r /tmp/rwt-checkpoints-out checkpoints
-          git add state checkpoints
+          git add -f state checkpoints
           git diff --cached --quiet || git commit -m "rwt: checkpoint state"
           git push origin rwt-state
