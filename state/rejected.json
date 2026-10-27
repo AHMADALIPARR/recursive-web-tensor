@@ -1,0 +1,1 @@
+{"metrics":{"heldout_loss":11.743148772653269,"heldout_tokens":150,"perplexity":125888.10963647824,"probe_loss":8.467840376258419,"probe_tokens":86},"reason":"held-out loss 11.7431 exceeds 9.2802 + tolerance 0.1000","version":"v2"}
