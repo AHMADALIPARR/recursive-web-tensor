@@ -1,0 +1,3 @@
+# Checkpoints are hash-sealed over exact bytes. Never rewrite line endings.
+/state/** -text
+/checkpoints/** -text

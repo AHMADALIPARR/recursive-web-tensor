@@ -32,7 +32,19 @@ concurrency:
   group: token-engine
   cancel-in-progress: false
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test engine and checkpoint gate
+        run: cargo test --release --locked
+      - name: Test Git checkpoint byte preservation
+        run: python3 scripts/test_state_roundtrip.py
   process:
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
