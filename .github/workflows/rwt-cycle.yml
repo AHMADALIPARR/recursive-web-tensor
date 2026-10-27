@@ -202,6 +202,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Restore prior state from rwt-state branch
         run: |
           git fetch origin rwt-state || true
